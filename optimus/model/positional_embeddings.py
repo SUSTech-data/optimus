@@ -14,6 +14,7 @@
 
 import torch
 import math
+import logging
 
 
 class SinusoidalPositionalEmbedding(torch.nn.Module):
@@ -62,6 +63,42 @@ class RotaryEmbedding(torch.nn.Module):
                 self.sin_cached = self.sin_cached.bfloat16()
         return self.cos_cached, self.sin_cached
 
+class RotaryEmbeddingLegacy(torch.nn.Module):
+    def __init__(self, dim, max_position_embeddings=2048, base=10000):
+        super().__init__()
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float().cuda() / dim))
+        # self.register_buffer("inv_freq", inv_freq)
+        self.inv_freq = inv_freq
+
+        # Build here to make `torch.jit.trace` work.
+        self.max_seq_len_cached = max_position_embeddings
+        t = torch.arange(self.max_seq_len_cached, device=self.inv_freq.device,
+                         dtype=self.inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        emb = torch.cat((freqs, freqs), dim=-1)
+        # self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
+        # self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
+        self.cos_cached = emb.cos()[None, None, :, :]
+        self.sin_cached = emb.sin()[None, None, :, :]
+
+    def forward(self, x, seq_len=None):
+        # x: [seq_len, bs, num_attention_heads, head_size]
+        # This `if` block is unlikely to be run after we build sin/cos in `__init__`. Keep the logic here just in case.
+        if seq_len > self.max_seq_len_cached:
+            self.max_seq_len_cached = seq_len
+            t = torch.arange(self.max_seq_len_cached, device=x.device, dtype=self.inv_freq.dtype)
+            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+            # Different from paper, but it uses a different permutation in order to obtain the same calculation
+            emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
+            # self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
+            # self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
+            self.cos_cached = emb.cos()[None, None, :, :]
+            self.sin_cached = emb.sin()[None, None, :, :]
+        return (
+            self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+            self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+        )
 
 # rotary pos emb helpers:
 
@@ -89,6 +126,15 @@ def apply_rotary_pos_emb_torch(
         cos[offset : q.shape[0] + offset, ...],
         sin[offset : q.shape[0] + offset, ...],
     )
+    return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
+
+def apply_rotary_pos_emb_torch_for_left_padding(q, k, cos, sin, position_ids):
+    # q: [seq_len, bs, num_attention_heads, head_size]
+    gather_indices = position_ids[:, None, :, None]  # [bs, 1, seq_len, 1]
+    gather_indices = gather_indices.repeat(1, cos.shape[1], 1, cos.shape[3])
+    cos = torch.gather(cos.repeat(gather_indices.shape[0], 1, 1, 1), 2, gather_indices).contiguous()
+    sin = torch.gather(sin.repeat(gather_indices.shape[0], 1, 1, 1), 2, gather_indices).contiguous()
+    cos, sin = cos.permute(2, 0, 1, 3).contiguous(), sin.permute(2, 0, 1, 3).contiguous()
     return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
 
 

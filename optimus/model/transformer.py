@@ -35,7 +35,9 @@ from optimus.model.activations import get_activation
 from optimus.model.utils import exists, get_fusion_type
 from optimus.model.positional_embeddings import (
     RotaryEmbedding,
+    RotaryEmbeddingLegacy,
     apply_rotary_pos_emb_torch,
+    apply_rotary_pos_emb_torch_for_left_padding,
     apply_rotary_pos_emb,
     AliBi,
 )
@@ -72,6 +74,47 @@ torch._C._jit_override_can_fuse_on_gpu(True)
                masked-attention-scores = attention_mask_func(
                                      unmasked-attention-scores, attention-mask)
 """
+
+
+def flatten_sequence(batch, attention_mask):
+    """
+    Flattens a batch of sequences.
+
+    Args:
+    - batch (torch.Tensor): A tensor of shape (batch_size, sequence_length) containing sequences.
+    - attention_mask (torch.Tensor): A tensor of shape (batch_size, sequence_length) indicating valid tokens.
+
+    Returns:
+    - torch.Tensor: A single flattened sequence.
+    - torch.Tensor: Tensor of end positions for the original sequences in the batch.
+    """
+    valid_tokens = batch[attention_mask.bool()]
+    end_positions = attention_mask.sum(dim=1).cumsum(0).int()
+    return valid_tokens, end_positions
+
+
+def restore_sequence(flattened, end_positions, original_length, pad_value=0):
+    """
+    Restores the original batch of sequences from a flattened sequence.
+
+    Args:
+    - flattened (torch.Tensor): The flattened sequence.
+    - end_positions (torch.Tensor): Tensor of end positions for the original sequences in the batch.
+    - original_length (int): Length of sequences in the original batch.
+    - pad_value (int, optional): Value to use for padding. Default is 0.
+
+    Returns:
+    - torch.Tensor: Tensor of shape (batch_size, original_length) containing the restored sequences.
+    """
+    sequences = []
+    start_pos = 0
+    for end_pos in end_positions:
+        seq = flattened[start_pos:end_pos]
+        seq = F.pad(seq, (original_length - len(seq), 0), value=pad_value)
+        sequences.append(seq)
+        start_pos = end_pos
+
+    return torch.stack(sequences)
 
 
 class ParallelMLP(nn.Module):
@@ -365,6 +408,11 @@ class ParallelSelfAttention(nn.Module):
             self.rotary_emb = RotaryEmbedding(
                 dim, base=neox_args.rotary_emb_base, precision=neox_args.params_dtype
             )
+            self.rotary_emb_legacy = RotaryEmbeddingLegacy(
+                dim,
+                base=neox_args.rotary_emb_base,
+                max_position_embeddings=neox_args.max_position_embeddings,
+            )
         else:
             self.rotary_emb = None
 
@@ -379,41 +427,53 @@ class ParallelSelfAttention(nn.Module):
                 mpu=mpu,
             )
         else:
+
+            def map_int(x):
+                try:
+                    return int(x)
+                except ValueError:
+                    return 0
+
             if self.use_flash_attention:
                 self.use_flash_attn2 = False
                 try:
                     import flash_attn
 
                     flash_attn_version = tuple(
-                        map(int, flash_attn.__version__.split("."))
+                        map(map_int, flash_attn.__version__.split("."))
                     )
-                    if flash_attn_version < (1, 0, 0):
-                        raise ImportError("Please upgrade flash_attn to >= 1.0.0")
+                    if flash_attn_version < (2, 0, 0):
+                        raise ImportError("Please upgrade flash_attn to >= 2.0.0")
                     if flash_attn_version >= (2, 0, 0):
                         from flash_attn import (
                             flash_attn_qkvpacked_func,
                             flash_attn_func,
                             flash_attn_kvpacked_func,
+                            flash_attn_varlen_qkvpacked_func,
+                            flash_attn_varlen_kvpacked_func,
                         )
 
                         self.flash_qkv_fn = flash_attn_qkvpacked_func
                         self.flash_attn_fn = flash_attn_func
                         self.flash_kv_fn = flash_attn_kvpacked_func
-                        self.use_flash_attn2 = True
-                    else:  # between 1.0.0 and 2.0.0
-                        from flash_attn import (
-                            flash_attn_unpadded_qkvpacked_func_cuda,
-                            flash_attn_unpadded_kvpacked_func_cuda,
-                            flash_attn_unpadded_unpacked_func_triton,
-                        )
 
-                        self.flash_triton_fn = flash_attn_unpadded_unpacked_func_triton
-                        self.flash_qkv_fn = flash_attn_unpadded_qkvpacked_func_cuda
-                        self.flash_kv_fn = flash_attn_unpadded_kvpacked_func_cuda
+                        self.flash_var_qkv_fn = flash_attn_varlen_qkvpacked_func
+                        self.flash_var_kv_fn = flash_attn_varlen_kvpacked_func
+                        self.use_flash_attn2 = True
+                    # else:  # between 1.0.0 and 2.0.0
+                    #     from flash_attn import (
+                    #         flash_attn_unpadded_qkvpacked_func_cuda,
+                    #         flash_attn_unpadded_kvpacked_func_cuda,
+                    #         flash_attn_unpadded_unpacked_func_triton,
+                    #     )
+                    #
+                    #     self.flash_triton_fn = flash_attn_unpadded_unpacked_func_triton
+                    #     self.flash_qkv_fn = flash_attn_unpadded_qkvpacked_func_cuda
+                    #     self.flash_kv_fn = flash_attn_unpadded_kvpacked_func_cuda
 
                 except ImportError:
                     raise ImportError(
-                        "Please install flash_attn > 1.0"
+                        "Please install flash_attn > 2.0"
                     )  # support 1.0.4
             else:
                 self.scale_mask_softmax = FusedScaleMaskSoftmax(
@@ -546,32 +606,39 @@ class ParallelSelfAttention(nn.Module):
         context_layer = context_layer.view(*output_size)
         return context_layer
 
-    def flash_attention(self, query_layer, key_layer, value_layer):
-        # [b, np, sq, sk]
-        output_size = (
-            query_layer.size(1),
-            query_layer.size(2),
-            query_layer.size(0),
-            key_layer.size(0),
-        )
-        if self.use_flash_attn2:
-            if self.pos_emb != "rotary":
-                raise NotImplementedError("Flash attention 2 requires rotary pos emb")
+    def flash_attention(
+        self, query_layer, key_layer, value_layer, non_causal_attention_mask
+    ):
+        # assert self.use_flash_attn2, "flash attn <2 not implemented in optimus"
+        if self.pos_emb != "rotary":
+            raise NotImplementedError("Flash attention 2 requires rotary pos emb")
 
+        if non_causal_attention_mask is None:
+            # [b, np, sq, sk]
+            output_size = (
+                query_layer.size(1),
+                query_layer.size(2),
+                query_layer.size(0),
+                key_layer.size(0),
+            )
             # [sq, b, np, hn] -> [b, sq, 1, np, hn] for both q,k,v
-            kv_shape = key_layer.shape # [sq, b, np_kv, hn]
+            kv_shape = key_layer.shape  # [sq, b, np_kv, hn]
             key_layer = key_layer.transpose(0, 1).reshape(
                 kv_shape[1], kv_shape[0], 1, kv_shape[2], -1
             )
             value_layer = value_layer.transpose(0, 1).reshape(
                 kv_shape[1], kv_shape[0], 1, kv_shape[2], -1
             )
-
+            """
+            This means we dont need to consider left padding situation,
+            used in training and non-left padding generation, i.e. single sample
+            generation
+            """
             if self.isGQA:
-                q_shape = query_layer.shape # [sq, b, np_q, hn]
+                q_shape = query_layer.shape  # [sq, b, np_q, hn]
                 query_layer = query_layer.transpose(0, 1).reshape(
                     q_shape[1], q_shape[0], q_shape[2], -1
-                ) # reshape to continguous
+                )  # reshape to continguous
                 kv = torch.cat([key_layer, value_layer], dim=2)
                 # logging.info
                 output = self.flash_kv_fn(
@@ -604,100 +671,94 @@ class ParallelSelfAttention(nn.Module):
             matmul_result = matmul_result.transpose(1, 2)
             return matmul_result
 
-        if self.pos_emb != "alibi":
-            # [sk, b, np, hn] -> [b, sk, np, hn] -> [b * sk, 1, np, hn]
-            key_layer = key_layer.transpose(0, 1).reshape(
-                output_size[0] * output_size[3], 1, output_size[1], -1
+        """
+        Left padding generation
+        """
+        if self.isGQA:
+            # TODO:: support MQA & GQA
+            raise NotImplementedError("GQA & MQA Not support yet")
+
+        q_origin_len, batch_size = query_layer.shape[:2]
+        kv_origin_len = key_layer.shape[0]
+
+        # input_shape of qkv [sq, b, np, hn]
+        flatten_attention_mask = non_causal_attention_mask.flatten().bool()
+        end_positions = non_causal_attention_mask.sum(dim=1).cumsum(0).int()
+
+        qkv_shape = query_layer.shape  # used 2,3 for both q,k,v have
+        query_layer = query_layer.transpose(0, 1).reshape(
+            batch_size * q_origin_len, qkv_shape[2], qkv_shape[3]
+        )
+        if q_origin_len != 1:
+            query_layer = query_layer[flatten_attention_mask]
+
+        key_layer = key_layer.transpose(0, 1).reshape(
+            batch_size * kv_origin_len, 1, qkv_shape[2], qkv_shape[3]
+        )[flatten_attention_mask]
+        value_layer = value_layer.transpose(0, 1).reshape(
+            batch_size * kv_origin_len, 1, qkv_shape[2], qkv_shape[3]
+        )[flatten_attention_mask]
+        kv = torch.cat([key_layer, value_layer], dim=1)  # concat at second dim
+        kv_cum_len = torch.cat(
+            [
+                torch.tensor(
+                    [0], device=end_positions.device, dtype=end_positions.dtype
+                ),
+                end_positions,
+            ]
+        )
+        kv_max_seqlen = non_causal_attention_mask.sum(dim=1).max().int()
+        q_cum_len = (
+            kv_cum_len
+            if q_origin_len == kv_origin_len
+            else torch.cat(
+                [
+                    torch.tensor([0], device=end_positions.device, dtype=torch.int32),
+                    torch.arange(1,batch_size+1, device=end_positions.device, dtype=torch.int32),
+                ]
             )
-            value_layer = value_layer.transpose(0, 1).reshape(
-                output_size[0] * output_size[3], 1, output_size[1], -1
-            )
+        )
+        q_max_seqlen = kv_max_seqlen if q_origin_len == kv_origin_len else 1
+        # out shape [b*sq, np, hn]
+        out = self.flash_var_kv_fn(
+            query_layer,
+            kv,
+            q_cum_len,
+            kv_cum_len,
+            q_max_seqlen,
+            kv_max_seqlen,
+            softmax_scale=None,
+            causal=True,
+        )
+        # out = self.flash_var_qkv_fn(
+        #     qkv,
+        #     kv_cum_len,
+        #     max_seqlen,
+        #     softmax_scale=None,
+        #     causal=True,
+        # )
 
-            batch_size = output_size[0]
-            max_seqlen_q = output_size[2]
-            max_seqlen_k = output_size[3]
+        # TODO: restore should be removed
 
-            cu_seqlens_q = torch.arange(
-                0,
-                (batch_size + 1) * max_seqlen_q,
-                step=max_seqlen_q,
-                dtype=torch.int32,
-                device=query_layer.device,
-            )
+        # restore
+        seqs = []
+        start_position = 0
+        for i in q_cum_len[1:]:
+            pad_length = q_origin_len - (i - start_position)
+            seq = out[start_position:i]  # first dim
+            # print(pad_length, seq.shape, i, cum_len)
+            seq = F.pad(
+                seq, (0, 0, 0, 0, pad_length, 0), value=0.0
+            )  # pad to max_seqlen
+            seqs.append(seq)
 
-            cu_seqlens_k = torch.arange(
-                0,
-                (batch_size + 1) * max_seqlen_k,
-                step=max_seqlen_k,
-                dtype=torch.int32,
-                device=key_layer.device,
-            )
+        # [b, sq, np, hn]
+        out = torch.stack(seqs, dim=0)
 
-            if not self.training:
-                # [sq, b, np, hn] -> [b * sq, np, hn]
-                query_layer = query_layer.transpose(0, 1).reshape(
-                    output_size[0] * output_size[2], output_size[1], -1
-                )
+        # [b, sq, np, hn] -> [b, np, sq, hn]
+        out = out.transpose(1, 2)
 
-                # Combined k/v into [b * sk, 2, np, hn].
-                kv = torch.cat([key_layer, value_layer], dim=1)
-
-                output = self.flash_kv_fn(
-                    query_layer,
-                    kv,
-                    cu_seqlens_q,
-                    cu_seqlens_k,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    self.dropout_p if self.training else 0.0,
-                    softmax_scale=None,
-                    causal=True,
-                )
-
-            else:
-                # [sq, b, np, hn] -> [b * sq, 1, np, hn]
-                query_layer = query_layer.transpose(0, 1).reshape(
-                    output_size[0] * output_size[2], 1, output_size[1], -1
-                )
-
-                # Combined q/k/v into [b * s, 3, np, hn].
-                qkv = torch.cat([query_layer, key_layer, value_layer], dim=1)
-
-                output = self.flash_qkv_fn(
-                    qkv,
-                    cu_seqlens_q,
-                    max_seqlen_q,
-                    self.dropout_p if self.training else 0.0,
-                    softmax_scale=None,
-                    causal=True,
-                )
-
-            # [b * sq, np, hn] -> [b, sq, np, hn]
-            matmul_result = output.view(
-                output_size[0], output_size[2], output.shape[1], output.shape[2]
-            )
-            # [b, sq, np, hn] -> [b, np, sq, hn]
-            matmul_result = matmul_result.transpose(1, 2)
-
-        else:
-            # [sq, b, np, hn] -> [b, sq, np, hn]
-            sq = query_layer.size(0)
-            b = query_layer.size(1)
-            sk = key_layer.size(0)
-
-            query_layer = query_layer.transpose(0, 1)
-            key_layer = key_layer.transpose(0, 1)
-            value_layer = value_layer.transpose(0, 1)
-
-            bias = self.alibi_embed.bias(sq, sk, query_layer.device, query_layer.dtype)
-            bias = bias.unsqueeze(0).tile((b, 1, 1, 1))
-
-            matmul_result = self.flash_triton_fn(
-                query_layer, key_layer, value_layer, bias=bias, causal=True
-            )
-            matmul_result = matmul_result.transpose(1, 2)
-
-        return matmul_result
+        return out
 
     def sparse_attention(self, query_layer, key_layer, value_layer, attention_mask):
         # TODO: sparse attn dropout?
@@ -741,7 +802,15 @@ class ParallelSelfAttention(nn.Module):
         )
         return query_layer, key_layer, value_layer
 
-    def forward(self, hidden_states, attention_mask, layer_past=None):
+    def forward(
+        self,
+        hidden_states,
+        attention_mask,
+        layer_past=None,
+        non_causal_attention_mask=None,
+        position_ids=None,
+    ):
+        # Non causal attention mask is used for generating
         # hidden_states: [sq, b, h]
 
         # =====================
@@ -792,10 +861,19 @@ class ParallelSelfAttention(nn.Module):
             if exists(layer_past) and layer_past.numel() > 0:
                 offset = layer_past[0].shape[0]
                 seq_len += offset
-            cos, sin = self.rotary_emb(value_layer, seq_len=seq_len)
-            query_layer, key_layer = apply_rotary_fn(
-                query_rot, key_rot, cos, sin, offset=offset
-            )
+            if position_ids is None:
+                cos, sin = self.rotary_emb(value_layer, seq_len=seq_len)
+                # use position ids when left padding
+                query_layer, key_layer = apply_rotary_fn(
+                    query_rot, key_rot, cos, sin, offset=offset
+                )
+            else:
+                # define for bf16 `ONLY` (torch version not jit)
+                cos, sin = self.rotary_emb_legacy(value_layer, seq_len=seq_len)
+                logging.debug("go to left padding rope")
+                query_layer, key_layer = apply_rotary_pos_emb_torch_for_left_padding(
+                    query_rot, key_rot, cos, sin, position_ids=position_ids
+                )
 
             if exists(self.rotary_ndims):
                 query_layer = torch.cat((query_layer, query_pass), dim=-1)
@@ -816,7 +894,10 @@ class ParallelSelfAttention(nn.Module):
             present = torch.stack((key_layer, value_layer))
 
         if self.use_flash_attention:
-            context_layer = self.flash_attention(query_layer, key_layer, value_layer)
+            # logging.debug("USE FLASH ATTENTION")
+            context_layer = self.flash_attention(
+                query_layer, key_layer, value_layer, non_causal_attention_mask
+            )
 
         elif not self.sparse:
             context_layer = self.attention(
@@ -933,7 +1014,14 @@ class ParallelTransformerLayer(nn.Module):
             fn = get_bias_dropout_add(self.training)
         return fn
 
-    def forward(self, x, attention_mask, layer_past=None):
+    def forward(
+        self,
+        x,
+        attention_mask,
+        layer_past=None,
+        non_causal_attention_mask=None,
+        position_ids=None,
+    ):
         layer_past = layer_past if layer_past is not None else self.layer_past
         bias_dropout_fn = self._get_bias_dropout()
         # x: [b, s, h]
@@ -955,7 +1043,11 @@ class ParallelTransformerLayer(nn.Module):
 
             # attention operator
             attention_output, attention_bias = self.attention(
-                x1, attention_mask, layer_past=layer_past
+                x1,
+                attention_mask,
+                layer_past=layer_past,
+                non_causal_attention_mask=non_causal_attention_mask,
+                position_ids=position_ids,
             )
             if self.use_cache:
                 attention_output, presents = attention_output
@@ -990,7 +1082,11 @@ class ParallelTransformerLayer(nn.Module):
 
             # x = x + attn(ln1(x))
             attention_output, attention_bias = self.attention(
-                self.input_layernorm(x), attention_mask, layer_past=layer_past
+                self.input_layernorm(x),
+                attention_mask,
+                layer_past=layer_past,
+                non_causal_attention_mask=non_causal_attention_mask,
+                position_ids=position_ids,
             )
             if self.use_cache:
                 attention_output, presents = attention_output
@@ -1033,7 +1129,10 @@ class ParallelTransformerLayer(nn.Module):
                         prob=self.hidden_dropout,
                     )
 
-        return output
+        if self.use_cache:
+            return output, self.layer_past
+        else:
+            return output
 
 
 class ParallelTransformerLayerPipe(ParallelTransformerLayer):

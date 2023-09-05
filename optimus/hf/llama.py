@@ -1,4 +1,3 @@
-
 # Copyright 2022 EleutherAI The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,7 +26,8 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
 )
 from transformers.modeling_utils import PreTrainedModel
-from transformers.utils import logging
+# from transformers.utils import logging
+import logging
 
 from optimus.model.init_functions import get_init_methods
 from optimus.model.norms import get_norm
@@ -39,7 +39,7 @@ from optimus.model.fused_softmax import FusedScaleMaskSoftmax
 
 """ llama model configuration"""
 
-logger = logging.get_logger(__name__)
+# logger = logging.get_logger(__name__)
 
 
 # We use huggingface config as the pesudo `neox_args` to create megatron model of GPTNeoX
@@ -185,7 +185,7 @@ def expand_attention_types(attention_config, num_layers):
     return newlist
 
 
-logger = logging.get_logger(__name__)
+# logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaConfig"
 
@@ -297,8 +297,9 @@ class LlamaModel(LlamaPreTrainedModel):
             layer.attention.use_cache = use_cache
 
             # disable flash attention if cache is enabled
-            use_fmha = layer.attention.use_flash_attention
-            layer.attention.use_flash_attention = (not use_cache) and use_fmha
+
+            # use_fmha = layer.attention.use_flash_attention
+            # layer.attention.use_flash_attention = (not use_cache) and use_fmha
 
         self.use_cache = use_cache
 
@@ -319,6 +320,7 @@ class LlamaModel(LlamaPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        left_padding: Optional[bool] = False,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         r"""
         past_key_values (`tuple(tuple(torch.FloatTensor))` of length `config.n_layers` with each tuple having 4 tensors of shape `(batch_size, num_heads, sequence_length - 1, embed_size_per_head)`):
@@ -374,7 +376,9 @@ class LlamaModel(LlamaPreTrainedModel):
             position_ids = position_ids.view(-1, seq_length).long()
 
         # Attention mask.
+        non_causal_attention_mask = None
         if attention_mask is not None:
+            non_causal_attention_mask = attention_mask.clone()
             assert batch_size > 0, "batch_size has to be defined and > 0"
             attention_mask = attention_mask.view(batch_size, -1)
             attention_mask = attention_mask[:, None, None, :]
@@ -396,15 +400,22 @@ class LlamaModel(LlamaPreTrainedModel):
             if self.gradient_checkpointing:
                 hidden_states = checkpoint(layer, hidden_states, attention_mask)
             else:
-                hidden_states = layer(
+                # use cache should close grad checkpoint
+                # we use position_ids when use cache and left padding
+                out = layer(
                     hidden_states,
                     attention_mask=attention_mask,
-                    layer_past=None,  # use layer.layerpast
-                    # position_ids=position_ids,
+                    layer_past=layer_past,  # use layer.layerpast
+                    non_causal_attention_mask=non_causal_attention_mask
+                    if left_padding
+                    else None,
+                    position_ids=position_ids if left_padding else None,
                 )
-
-            if self.use_cache:
-                presents = presents + (layer.layer_past,)
+                if self.use_cache:
+                    hidden_states, cache = out
+                    presents = presents + (cache,)
+                else:
+                    hidden_states = out
 
             if output_attentions:
                 all_attentions = all_attentions + (layer.layer_past,)
@@ -474,7 +485,6 @@ class LlamaForPerplexity(LlamaPreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         compute_perplexity_loss_c1r4: Optional[bool] = False,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-
         loss_mask = attention_mask.float().clone()
 
         if position_ids is None:
@@ -517,7 +527,7 @@ class LlamaForPerplexity(LlamaPreTrainedModel):
             reject3 = values[3 * num_sample : 4 * num_sample]
             reject4 = values[4 * num_sample :]
             loss_logits = 4 * chosen - reject1 - reject2 - reject3 - reject4
-            loss = - torch.nn.functional.logsigmoid(loss_logits).mean()
+            loss = -torch.nn.functional.logsigmoid(loss_logits).mean()
             return loss
 
         # reutrn perplexity for convenience
@@ -556,7 +566,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        compute_lm_loss: Optional[bool] = True,
+        compute_lm_loss: Optional[bool] = False,
+        left_padding=False,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
@@ -586,17 +597,18 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             return_dict if return_dict is not None else self.config.use_return_dict
         )
 
+        batch_size, seq_length = input_ids.size()
         # if model is used as a decoder in encoder-decoder model, the decoder attention mask is created on the fly
         if attention_mask is None:
             attention_mask = input_ids.new_ones(input_ids.shape)
 
-        if position_ids is None:
-            # Position ids.
-            batch_size, seq_length = input_ids.size()
-            position_ids = torch.arange(
-                seq_length, dtype=torch.long, device=input_ids.device
-            )
-            position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+
+        if left_padding:
+            logging.debug("left padding enbled")
 
         outputs = self.llama(
             input_ids,
@@ -607,6 +619,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            left_padding=left_padding,
         )
 
         hidden_states = outputs[0]
@@ -660,6 +673,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             "attention_mask": attention_mask,
             "position_ids": position_ids,
             "past_key_values": past_key_values,
+            **kwargs,
         }
 
     def _reorder_cache(self, past_key_values, beam_idx):
