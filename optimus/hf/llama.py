@@ -256,26 +256,31 @@ class LlamaModel(LlamaPreTrainedModel):
         # so we disable fmha when generating by creating `FuseScaleMaskSoftmax`
         # object at the time of LLaMA Model initialization.
         # Note that the model is not sparse for sure, so we can ignore the flag of sparse part
-        for layer in self.layers:
-            if not hasattr(layer.attention, "scale_mask_softmax"):
-                attention_obj = layer.attention
-                coeff = None
-                if attention_obj.apply_query_key_layer_scaling:
-                    coeff = max(1, attention_obj.layer_number)
-                    attention_obj.norm_factor *= coeff
-
-                attention_obj.scale_mask_softmax = FusedScaleMaskSoftmax(
-                    input_in_fp16=attention_obj.fp16,
-                    input_in_bf16=attention_obj.bf16,
-                    fusion_type=get_fusion_type(config),
-                    mask_func=attention_obj.attention_mask_func,
-                    softmax_in_fp32=attention_obj.attention_softmax_in_fp32,
-                    scale=coeff,
-                )
-
+        """
+        Legacy
+        we dont need to use this anymore,
+        we always have fused softmax module
+        """
+        # for layer in self.layers:
+        #     if not hasattr(layer.attention, "scale_mask_softmax"):
+        #         attention_obj = layer.attention
+        #         coeff = None
+        #         if attention_obj.apply_query_key_layer_scaling:
+        #             coeff = max(1, attention_obj.layer_number)
+        #             attention_obj.norm_factor *= coeff
+        #
+        #         attention_obj.scale_mask_softmax = FusedScaleMaskSoftmax(
+        #             input_in_fp16=attention_obj.fp16,
+        #             input_in_bf16=attention_obj.bf16,
+        #             fusion_type=get_fusion_type(config),
+        #             mask_func=attention_obj.attention_mask_func,
+        #             softmax_in_fp32=attention_obj.attention_softmax_in_fp32,
+        #             scale=coeff,
+        #         )
+        
         self.post_init()
 
-        self.use_cache = config.use_cache
+        self.use_cache = None
         self.kv_enabled(config.use_cache)
 
     def get_input_embeddings(self):
@@ -297,18 +302,18 @@ class LlamaModel(LlamaPreTrainedModel):
             layer.attention.use_cache = use_cache
 
             # disable flash attention if cache is enabled
-
             # use_fmha = layer.attention.use_flash_attention
             # layer.attention.use_flash_attention = (not use_cache) and use_fmha
 
         self.use_cache = use_cache
 
-    def clear_kv_cache(self):
+    def clear_kv_cache(self, empty_cache=False):
         for layer in self.layers:
             layer.layer_past = None
-        self.kv_enabled(False)
-        gc.collect()
-        torch.cuda.empty_cache()
+        # self.kv_enabled(False)
+        if empty_cache:
+            gc.collect()
+            torch.cuda.empty_cache()
 
     def forward(
         self,

@@ -435,16 +435,21 @@ class ParallelSelfAttention(nn.Module):
                     return 0
 
             if self.use_flash_attention:
-                self.use_flash_attn2 = False
+                """
+                Optimus only support flash attention > 2.1
+                because only uppon 2.1, causal mask of fmha
+                can handle the left padding generation
+                """
+                # self.use_flash_attn2 = False
                 try:
                     import flash_attn
 
                     flash_attn_version = tuple(
                         map(map_int, flash_attn.__version__.split("."))
                     )
-                    if flash_attn_version < (2, 0, 0):
-                        raise ImportError("Please upgrade flash_attn to >= 2.0.0")
-                    if flash_attn_version >= (2, 0, 0):
+                    if flash_attn_version < (2, 1, 0):
+                        raise ImportError("Please upgrade flash_attn to >= 2.1.0")
+                    else:
                         from flash_attn import (
                             flash_attn_qkvpacked_func,
                             flash_attn_func,
@@ -459,31 +464,23 @@ class ParallelSelfAttention(nn.Module):
 
                         self.flash_var_qkv_fn = flash_attn_varlen_qkvpacked_func
                         self.flash_var_kv_fn = flash_attn_varlen_kvpacked_func
-                        self.use_flash_attn2 = True
-                    # else:  # between 1.0.0 and 2.0.0
-                    #     from flash_attn import (
-                    #         flash_attn_unpadded_qkvpacked_func_cuda,
-                    #         flash_attn_unpadded_kvpacked_func_cuda,
-                    #         flash_attn_unpadded_unpacked_func_triton,
-                    #     )
-                    #
-                    #     self.flash_triton_fn = flash_attn_unpadded_unpacked_func_triton
-                    #     self.flash_qkv_fn = flash_attn_unpadded_qkvpacked_func_cuda
-                    #     self.flash_kv_fn = flash_attn_unpadded_kvpacked_func_cuda
+                        # self.use_flash_attn2 = True
 
                 except ImportError:
-                    raise ImportError(
-                        "Please install flash_attn > 2.0"
-                    )  # support 1.0.4
-            else:
-                self.scale_mask_softmax = FusedScaleMaskSoftmax(
-                    input_in_fp16=self.fp16,
-                    input_in_bf16=self.bf16,
-                    fusion_type=get_fusion_type(neox_args),
-                    mask_func=self.attention_mask_func,
-                    softmax_in_fp32=self.attention_softmax_in_fp32,
-                    scale=coeff,
-                )
+                    logging.warning("flash_attn not found, using default attn")
+                    logging.warning("Please upgrade flash_attn to >= 2.1.0")
+                    self.use_flash_attention = False
+                    # raise ImportError("Please install flash_attn >= 2.1.0")
+
+            # use for flash attention not enabled
+            self.scale_mask_softmax = FusedScaleMaskSoftmax(
+                input_in_fp16=self.fp16,
+                input_in_bf16=self.bf16,
+                fusion_type=get_fusion_type(neox_args),
+                mask_func=self.attention_mask_func,
+                softmax_in_fp32=self.attention_softmax_in_fp32,
+                scale=coeff,
+            )
 
             # Dropout. Note that for a single iteration, this layer will generate
             # different outputs on different number of parallel partitions but
@@ -714,7 +711,12 @@ class ParallelSelfAttention(nn.Module):
             else torch.cat(
                 [
                     torch.tensor([0], device=end_positions.device, dtype=torch.int32),
-                    torch.arange(1,batch_size+1, device=end_positions.device, dtype=torch.int32),
+                    torch.arange(
+                        1,
+                        batch_size + 1,
+                        device=end_positions.device,
+                        dtype=torch.int32,
+                    ),
                 ]
             )
         )
