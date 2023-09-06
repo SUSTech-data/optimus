@@ -764,6 +764,7 @@ class ParallelSelfAttention(nn.Module):
         layer_past=None,
         non_causal_attention_mask=None,
         position_ids=None,
+        global_layer_past=None,
     ):
         # Non causal attention mask is used for generating
         # hidden_states: [sq, b, h]
@@ -844,6 +845,9 @@ class ParallelSelfAttention(nn.Module):
             value_layer = torch.cat(
                 (past_value.type_as(value_layer), value_layer), dim=0
             )
+
+        # if exists(global_layer_past) and global_layer_past.numel() > 0:
+        #     key_layer = torch.cat()
 
         if self.use_cache:
             present = torch.stack((key_layer, value_layer))

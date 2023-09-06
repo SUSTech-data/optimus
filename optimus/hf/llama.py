@@ -256,9 +256,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
         self.post_init()
 
-        self.use_cache = False
-        if config.use_cache:
-            self.kv_enabled(True)
+        self.kv_enabled(config.use_cache)
 
     def get_input_embeddings(self):
         return self.embed_in
@@ -283,14 +281,11 @@ class LlamaModel(LlamaPreTrainedModel):
             # layer.attention.use_flash_attention = (not use_cache) and use_fmha
 
         self.use_cache = use_cache
+        self.gradient_checkpointing = not use_cache
 
-    def clear_kv_cache(self, empty_cache=False):
-        for layer in self.layers:
-            layer.layer_past = None
-        # self.kv_enabled(False)
-        if empty_cache:
-            gc.collect()
-            torch.cuda.empty_cache()
+    def checkpointing_enabled(self, c:bool):
+        self.kv_enabled(not c)
+        # self.gradient_checkpointing = c  # done in kv_enabled
 
     def forward(
         self,
@@ -451,78 +446,6 @@ class LlamaModel(LlamaPreTrainedModel):
         return
 
 
-class LlamaForPerplexity(LlamaPreTrainedModel):
-    def __init__(self, config):
-        super().__init__(config)
-
-        self.llama = LlamaModel(config)
-        self.init_method, self.output_layer_init_method = get_init_methods(config)
-        self.embed_out = ParallelLinear(
-            self.config,
-            init_method=self.init_method,
-            parallel_output=False,
-        )
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
-        self.llama.kv_enabled(False)
-        self.llama.fmha_enabled(True)
-
-    def forward(
-        self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        compute_perplexity_loss_c1r4: Optional[bool] = False,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
-        loss_mask = attention_mask.float().clone()
-
-        if position_ids is None:
-            # Position ids.
-            batch_size, seq_length = input_ids.size()
-            position_ids = torch.arange(
-                seq_length, dtype=torch.long, device=input_ids.device
-            )
-            position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
-
-        outputs = self.llama(
-            input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=None,
-            use_cache=False,
-            output_attentions=False,
-            output_hidden_states=False,
-            return_dict=False,
-        )
-
-        hidden_states = outputs[0]
-        lm_logits = self.embed_out(hidden_states)[0]
-
-        labels = input_ids[:, 1:].contiguous()
-        loss_mask = loss_mask[:, 1:].contiguous()
-        shift_logits = lm_logits[:, :-1, :].float().contiguous()
-        logprobs = torch.nn.functional.log_softmax(shift_logits, dim=-1)
-        values = torch.gather(logprobs, -1, labels.unsqueeze(-1)).squeeze(-1)
-        # sum on seq_len dim
-        values = values * loss_mask
-        values = values.sum(axis=-1)
-
-        if compute_perplexity_loss_c1r4:
-            total_batch_size = input_ids.size(0)
-            num_sample = total_batch_size // 5
-            chosen = values[:num_sample]
-            reject1 = values[num_sample : 2 * num_sample]
-            reject2 = values[2 * num_sample : 3 * num_sample]
-            reject3 = values[3 * num_sample : 4 * num_sample]
-            reject4 = values[4 * num_sample :]
-            loss_logits = 4 * chosen - reject1 - reject2 - reject3 - reject4
-            loss = -torch.nn.functional.logsigmoid(loss_logits).mean()
-            return loss
-
-        # reutrn perplexity for convenience
-        return values
 
 
 class LlamaForCausalLM(LlamaPreTrainedModel):
@@ -589,7 +512,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         )
 
         batch_size, seq_length = input_ids.size()
-        # if model is used as a decoder in encoder-decoder model, the decoder attention mask is created on the fly
         if attention_mask is None:
             attention_mask = input_ids.new_ones(input_ids.shape)
 
@@ -598,8 +520,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
 
-        if left_padding:
-            logging.debug("left padding enbled")
+        # if left_padding:
+        #     logging.debug("left padding enbled")
 
         outputs = self.llama(
             input_ids,
@@ -882,4 +804,80 @@ class LlamaForRM(LlamaPreTrainedModel):
             ).mean()
             return loss
 
+        return values
+
+class LlamaForPerplexity(LlamaForCausalLM):
+    def __init__(self, config):
+        super().__init__(config)
+
+        self.llama = LlamaModel(config)
+        self.init_method, self.output_layer_init_method = get_init_methods(config)
+        self.embed_out = ParallelLinear(
+            self.config,
+            init_method=self.init_method,
+            parallel_output=False,
+        )
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+        self.llama.kv_enabled(False)
+        self.llama.fmha_enabled(True)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        compute_perplexity_loss_c1r4: Optional[bool] = False,
+        lm_mode: Optional[bool] = False,
+        **kwargs,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+
+        loss_mask = attention_mask.float().clone()
+
+        if position_ids is None:
+            # Position ids.
+            batch_size, seq_length = input_ids.size()
+            position_ids = torch.arange(
+                seq_length, dtype=torch.long, device=input_ids.device
+            )
+            position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
+
+        outputs = self.llama(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=None,
+            use_cache=False,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=False,
+        )
+
+        hidden_states = outputs[0]
+        lm_logits = self.embed_out(hidden_states)[0]
+
+        labels = input_ids[:, 1:].contiguous()
+        loss_mask = loss_mask[:, 1:].contiguous()
+        shift_logits = lm_logits[:, :-1, :].float().contiguous()
+        logprobs = torch.nn.functional.log_softmax(shift_logits, dim=-1)
+        values = torch.gather(logprobs, -1, labels.unsqueeze(-1)).squeeze(-1)
+        # sum on seq_len dim
+        values = values * loss_mask
+        values = values.sum(axis=-1)
+
+        if compute_perplexity_loss_c1r4:
+            total_batch_size = input_ids.size(0)
+            num_sample = total_batch_size // 5
+            chosen = values[:num_sample]
+            reject1 = values[num_sample : 2 * num_sample]
+            reject2 = values[2 * num_sample : 3 * num_sample]
+            reject3 = values[3 * num_sample : 4 * num_sample]
+            reject4 = values[4 * num_sample :]
+            loss_logits = 4 * chosen - reject1 - reject2 - reject3 - reject4
+            loss = -nn.functional.logsigmoid(loss_logits).mean()
+            return loss
+
+        # reutrn perplexity for convenience
         return values
