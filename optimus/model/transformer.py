@@ -76,47 +76,6 @@ torch._C._jit_override_can_fuse_on_gpu(True)
 """
 
 
-def flatten_sequence(batch, attention_mask):
-    """
-    Flattens a batch of sequences.
-
-    Args:
-    - batch (torch.Tensor): A tensor of shape (batch_size, sequence_length) containing sequences.
-    - attention_mask (torch.Tensor): A tensor of shape (batch_size, sequence_length) indicating valid tokens.
-
-    Returns:
-    - torch.Tensor: A single flattened sequence.
-    - torch.Tensor: Tensor of end positions for the original sequences in the batch.
-    """
-    valid_tokens = batch[attention_mask.bool()]
-    end_positions = attention_mask.sum(dim=1).cumsum(0).int()
-    return valid_tokens, end_positions
-
-
-def restore_sequence(flattened, end_positions, original_length, pad_value=0):
-    """
-    Restores the original batch of sequences from a flattened sequence.
-
-    Args:
-    - flattened (torch.Tensor): The flattened sequence.
-    - end_positions (torch.Tensor): Tensor of end positions for the original sequences in the batch.
-    - original_length (int): Length of sequences in the original batch.
-    - pad_value (int, optional): Value to use for padding. Default is 0.
-
-    Returns:
-    - torch.Tensor: Tensor of shape (batch_size, original_length) containing the restored sequences.
-    """
-    sequences = []
-    start_pos = 0
-    for end_pos in end_positions:
-        seq = flattened[start_pos:end_pos]
-        seq = F.pad(seq, (original_length - len(seq), 0), value=pad_value)
-        sequences.append(seq)
-        start_pos = end_pos
-
-    return torch.stack(sequences)
-
-
 class ParallelMLP(nn.Module):
     """MLP.
 
@@ -608,9 +567,16 @@ class ParallelSelfAttention(nn.Module):
     ):
         # assert self.use_flash_attn2, "flash attn <2 not implemented in optimus"
         if self.pos_emb != "rotary":
-            raise NotImplementedError("Flash attention 2 requires rotary pos emb")
+            raise NotImplementedError(
+                "Flash attention 2 requires rotary pos emb for now"
+            )
 
         if non_causal_attention_mask is None:
+            """
+            This means we dont need to consider left padding situation,
+            used in training and non-left padding generation, i.e. single sample
+            generation
+            """
             # [b, np, sq, sk]
             output_size = (
                 query_layer.size(1),
@@ -626,11 +592,6 @@ class ParallelSelfAttention(nn.Module):
             value_layer = value_layer.transpose(0, 1).reshape(
                 kv_shape[1], kv_shape[0], 1, kv_shape[2], -1
             )
-            """
-            This means we dont need to consider left padding situation,
-            used in training and non-left padding generation, i.e. single sample
-            generation
-            """
             if self.isGQA:
                 q_shape = query_layer.shape  # [sq, b, np_q, hn]
                 query_layer = query_layer.transpose(0, 1).reshape(
@@ -664,8 +625,9 @@ class ParallelSelfAttention(nn.Module):
                 output_size[0], output_size[2], output.shape[2], output.shape[3]
             )
 
-            # [b, sq, np, hn] -> [b, np, sq, hn]
-            matmul_result = matmul_result.transpose(1, 2)
+            # [b, sq, np, hn] -> [b, np, sq, hn] (x)
+            # return [sq, b, np, hn]
+            matmul_result = matmul_result.transpose(0, 1)
             return matmul_result
 
         """
@@ -697,19 +659,19 @@ class ParallelSelfAttention(nn.Module):
         )[flatten_attention_mask]
         kv = torch.cat([key_layer, value_layer], dim=1)  # concat at second dim
         kv_cum_len = torch.cat(
-            [
+            (
                 torch.tensor(
                     [0], device=end_positions.device, dtype=end_positions.dtype
                 ),
                 end_positions,
-            ]
+            )
         )
         kv_max_seqlen = non_causal_attention_mask.sum(dim=1).max().int()
         q_cum_len = (
             kv_cum_len
             if q_origin_len == kv_origin_len
             else torch.cat(
-                [
+                (
                     torch.tensor([0], device=end_positions.device, dtype=torch.int32),
                     torch.arange(
                         1,
@@ -717,7 +679,7 @@ class ParallelSelfAttention(nn.Module):
                         device=end_positions.device,
                         dtype=torch.int32,
                     ),
-                ]
+                )
             )
         )
         q_max_seqlen = kv_max_seqlen if q_origin_len == kv_origin_len else 1
@@ -732,13 +694,6 @@ class ParallelSelfAttention(nn.Module):
             softmax_scale=None,
             causal=True,
         )
-        # out = self.flash_var_qkv_fn(
-        #     qkv,
-        #     kv_cum_len,
-        #     max_seqlen,
-        #     softmax_scale=None,
-        #     causal=True,
-        # )
 
         # TODO: restore should be removed
 
@@ -755,11 +710,9 @@ class ParallelSelfAttention(nn.Module):
             seqs.append(seq)
 
         # [b, sq, np, hn]
-        out = torch.stack(seqs, dim=0)
-
-        # [b, sq, np, hn] -> [b, np, sq, hn]
-        out = out.transpose(1, 2)
-
+        # [b, sq, np, hn] -> [sq, b, np, hn]
+        out = torch.stack(seqs, dim=1)
+        # out = out.transpose(0, 1)
         return out
 
     def sparse_attention(self, query_layer, key_layer, value_layer, attention_mask):
@@ -872,7 +825,7 @@ class ParallelSelfAttention(nn.Module):
             else:
                 # define for bf16 `ONLY` (torch version not jit)
                 cos, sin = self.rotary_emb_legacy(value_layer, seq_len=seq_len)
-                logging.debug("go to left padding rope")
+                # logging.debug("go to left padding rope")
                 query_layer, key_layer = apply_rotary_pos_emb_torch_for_left_padding(
                     query_rot, key_rot, cos, sin, position_ids=position_ids
                 )
@@ -896,10 +849,30 @@ class ParallelSelfAttention(nn.Module):
             present = torch.stack((key_layer, value_layer))
 
         if self.use_flash_attention:
-            # logging.debug("USE FLASH ATTENTION")
+            # use flash attention avoid more transpose
             context_layer = self.flash_attention(
                 query_layer, key_layer, value_layer, non_causal_attention_mask
+            ).contiguous()
+
+            # context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
+            # logging.debug("flash attn output shape: {}".format(context_layer.shape))
+
+            # [sq, b, np, hn] --> [sq, b, hp]
+            new_context_layer_shape = context_layer.size()[:-2] + (
+                self.hidden_size_per_partition,
             )
+            context_layer = context_layer.view(*new_context_layer_shape)
+
+            # Output. [sq, b, h]
+
+            output, bias = self.dense(context_layer)
+
+            # logging.debug("flash attn output shape: {}".format(output.shape))
+
+            if self.use_cache:
+                output = [output, present]
+
+            return output, bias
 
         elif not self.sparse:
             context_layer = self.attention(
@@ -1024,7 +997,7 @@ class ParallelTransformerLayer(nn.Module):
         non_causal_attention_mask=None,
         position_ids=None,
     ):
-        layer_past = layer_past if layer_past is not None else self.layer_past
+        # layer_past = layer_past if layer_past is not None else self.layer_past
         bias_dropout_fn = self._get_bias_dropout()
         # x: [b, s, h]
         if self.gpt_j_residual:
@@ -1053,7 +1026,7 @@ class ParallelTransformerLayer(nn.Module):
             )
             if self.use_cache:
                 attention_output, presents = attention_output
-                self.layer_past = presents
+                # self.layer_past = presents
 
             with torch.enable_grad():
                 attention_output = bias_dropout_fn(
@@ -1092,7 +1065,7 @@ class ParallelTransformerLayer(nn.Module):
             )
             if self.use_cache:
                 attention_output, presents = attention_output
-                self.layer_past = presents
+                # self.layer_past = presents
             with torch.enable_grad():
                 if attention_bias is not None:
                     # Use special bias_dropout_fn if we have a bias term from the above attention layer
@@ -1103,6 +1076,9 @@ class ParallelTransformerLayer(nn.Module):
                         prob=self.hidden_dropout,
                     )
                 else:
+                    # logging.debug("attention_bias is None")
+                    # logging.debug("attention_output shape: {}".format(attention_output.shape))
+                    # logging.debug("residual shape: {}".format(residual.shape))
                     # Otherwise just apply dropout + residual
                     attention_output = (
                         torch.nn.functional.dropout(
@@ -1132,7 +1108,7 @@ class ParallelTransformerLayer(nn.Module):
                     )
 
         if self.use_cache:
-            return output, self.layer_past
+            return output, presents
         else:
             return output
 

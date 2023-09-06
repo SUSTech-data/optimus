@@ -11,3 +11,5 @@ TODO:
 - less model control option
 - generator based on non-batch flash attention and self-design cuda fused kernel
 - Fixed pipeline model
+
+- KV Cache management by pre-malloc and reuse (pre-calculate)

@@ -10,8 +10,9 @@
 
 from ipytorch import logging
 logging.set_verbosity(logging.INFO)
+# logging.set_verbosity(logging.DEBUG)
 import os
-os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+# os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 import torch
 import optimus.mpu as mpu
@@ -63,7 +64,15 @@ print(prompt)
 
 # %%
 
-from transformers import AutoTokenizer, tokenization_utils_base
+question = "Hello, who are you?"
+header = f"""### Instruction:\n\n{question}"""
+mid = "\n### Response:"
+prompt1 = f"{header}{mid}"
+print(prompt1)
+
+# %%
+
+from transformers import AutoTokenizer
 import gc
 tokenizer = AutoTokenizer.from_pretrained("/data/hf/platypus-13b-mp4/part_0")
 tokenizer.padding_side = "left"
@@ -72,11 +81,8 @@ tokenizer.pad_token_id = tokenizer.eos_token_id
 
 # %%
 
-model.llama.clear_kv_cache()
-model.llama.fmha_enabled(True)
 model.llama.kv_enabled(True)
-# model.llama.fmha_enabled(True)
-model.llama.gradient_checkpointing = False
+model.llama.checkpointing_enabled(False)
 
 # %%
 
@@ -84,7 +90,7 @@ model.llama.gradient_checkpointing = False
 gc.collect()
 torch.cuda.empty_cache()
 
-inputs = tokenizer([prompt]*2, return_tensors="pt", max_length=64, padding="max_length")
+inputs = tokenizer([prompt, prompt1], return_tensors="pt", max_length=64, padding="max_length")
 # inputs = tokenizer(prompt, return_tensors="pt", max_length=64, padding=True)
 # inputs = tokenizer(prompt, return_tensors="pt")
 for k,v in inputs.items():
@@ -95,7 +101,11 @@ inputs.input_ids
 # %%
 
 out = model.generate(**inputs, do_sample=False, max_length=100, left_padding=True, use_cache=True)
+print("========================================")
 print(tokenizer.decode(out[0].tolist()))
+print("========================================")
+print(tokenizer.decode(out[1].tolist()))
+print("========================================")
 
 # %%
 

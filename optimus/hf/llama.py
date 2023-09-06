@@ -252,36 +252,13 @@ class LlamaModel(LlamaPreTrainedModel):
 
         self.gradient_checkpointing = True
 
-        # Flash attention 1.x has some bugs about forwarding with kv cache,
-        # so we disable fmha when generating by creating `FuseScaleMaskSoftmax`
-        # object at the time of LLaMA Model initialization.
-        # Note that the model is not sparse for sure, so we can ignore the flag of sparse part
-        """
-        Legacy
-        we dont need to use this anymore,
-        we always have fused softmax module
-        """
-        # for layer in self.layers:
-        #     if not hasattr(layer.attention, "scale_mask_softmax"):
-        #         attention_obj = layer.attention
-        #         coeff = None
-        #         if attention_obj.apply_query_key_layer_scaling:
-        #             coeff = max(1, attention_obj.layer_number)
-        #             attention_obj.norm_factor *= coeff
-        #
-        #         attention_obj.scale_mask_softmax = FusedScaleMaskSoftmax(
-        #             input_in_fp16=attention_obj.fp16,
-        #             input_in_bf16=attention_obj.bf16,
-        #             fusion_type=get_fusion_type(config),
-        #             mask_func=attention_obj.attention_mask_func,
-        #             softmax_in_fp32=attention_obj.attention_softmax_in_fp32,
-        #             scale=coeff,
-        #         )
-        
+        # in each of transformer layers, we have a fused softmax
+
         self.post_init()
 
-        self.use_cache = None
-        self.kv_enabled(config.use_cache)
+        self.use_cache = False
+        if config.use_cache:
+            self.kv_enabled(True)
 
     def get_input_embeddings(self):
         return self.embed_in
@@ -359,15 +336,16 @@ class LlamaModel(LlamaPreTrainedModel):
             return_dict if return_dict is not None else self.config.use_return_dict
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        presents = () if use_cache else None
 
         batch_size, seq_length = input_ids.size()
 
         if past_key_values is None:
             past_length = 0
-            past_key_values = tuple([None] * self.config.num_hidden_layers)
+            past_key_values = [None] * self.config.num_hidden_layers
         else:
             past_length = past_key_values[0][0].size(0)
+
+        # presents = past_key_values if use_cache else None
 
         if position_ids is None:
             position_ids = torch.arange(
@@ -381,9 +359,14 @@ class LlamaModel(LlamaPreTrainedModel):
             position_ids = position_ids.view(-1, seq_length).long()
 
         # Attention mask.
-        non_causal_attention_mask = None
-        if attention_mask is not None:
+        if left_padding:
             non_causal_attention_mask = attention_mask.clone()
+            position_ids_in = position_ids.clone()
+        else:
+            non_causal_attention_mask = None
+            position_ids_in = None
+
+        if attention_mask is not None:
             assert batch_size > 0, "batch_size has to be defined and > 0"
             attention_mask = attention_mask.view(batch_size, -1)
             attention_mask = attention_mask[:, None, None, :]
@@ -398,27 +381,30 @@ class LlamaModel(LlamaPreTrainedModel):
         all_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
-        for _, (layer, layer_past) in enumerate(zip(self.layers, past_key_values)):
+        # for _, (layer, layer_past) in enumerate(zip(self.layers, past_key_values)):
+        for i in range(self.config.num_hidden_layers):
+            layer = self.layers[i]
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
             if self.gradient_checkpointing:
+                # when use grad checkpoint, we don't use cache, then
+                # we dont need left padding, use ROPE New version
                 hidden_states = checkpoint(layer, hidden_states, attention_mask)
             else:
                 # use cache should close grad checkpoint
                 # we use position_ids when use cache and left padding
+                # use ROPE old version
                 out = layer(
                     hidden_states,
                     attention_mask=attention_mask,
-                    layer_past=layer_past,  # use layer.layerpast
-                    non_causal_attention_mask=non_causal_attention_mask
-                    if left_padding
-                    else None,
-                    position_ids=position_ids if left_padding else None,
+                    layer_past=past_key_values[i],
+                    non_causal_attention_mask=non_causal_attention_mask,
+                    position_ids=position_ids_in,
                 )
                 if self.use_cache:
                     hidden_states, cache = out
-                    presents = presents + (cache,)
+                    past_key_values[i] = cache
                 else:
                     hidden_states = out
 
@@ -441,7 +427,7 @@ class LlamaModel(LlamaPreTrainedModel):
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
-            past_key_values=list(presents) if presents is not None else presents,
+            past_key_values=past_key_values if self.use_cache else None,
             attentions=all_attentions,
         )
 
