@@ -26,6 +26,7 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
 )
 from transformers.modeling_utils import PreTrainedModel
+
 # from transformers.utils import logging
 import logging
 
@@ -35,6 +36,7 @@ from optimus.model.utils import get_fusion_type
 from optimus.model.transformer import ParallelLinear, ParallelTransformerLayer
 from optimus.model.word_embeddings import Embedding
 from optimus.model.fused_softmax import FusedScaleMaskSoftmax
+from optimus.generator.generator import Generator
 
 
 """ llama model configuration"""
@@ -283,7 +285,7 @@ class LlamaModel(LlamaPreTrainedModel):
         self.use_cache = use_cache
         self.gradient_checkpointing = not use_cache
 
-    def checkpointing_enabled(self, c:bool):
+    def checkpointing_enabled(self, c: bool):
         self.kv_enabled(not c)
         # self.gradient_checkpointing = c  # done in kv_enabled
 
@@ -446,8 +448,6 @@ class LlamaModel(LlamaPreTrainedModel):
         return
 
 
-
-
 class LlamaForCausalLM(LlamaPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
@@ -474,14 +474,14 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        compute_lm_loss: Optional[bool] = False,
         left_padding=False,
+        compute_lm_loss: Optional[bool] = False,
+        labels: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
@@ -629,46 +629,6 @@ class LlamaForRM(LlamaPreTrainedModel):
 
         self.bce_loss = nn.BCEWithLogitsLoss()
 
-    #     bf16_test_tensor = torch.arange(250, 260).float().cuda()
-    #     self.bf16_test_tensor2 = torch.arange(250, 260).float().cuda()
-    #     self.bf16_test_tensor3 = torch.arange(250, 260).float().cuda()
-    #     self.register_buffer("bf16_test_tensor", self.bf16_test_tensor2)
-    #     self.bf16_test_tensor.data = self.bf16_test_tensor2.data
-    #
-    # def test_bf16(self):
-    #     # a = torch.arange(250, 260).float().cuda().to(dtype=torch.float32)
-    #     a = torch.arange(250, 260, device="cuda").float()
-    #     print(
-    #         f"bf16 test before convert: bf16_test_tensor:{self.bf16_test_tensor.dtype}  "
-    #         f"a:{a.dtype}  bftest2:{self.bf16_test_tensor2.dtype}  "
-    #         f"bftest3:{self.bf16_test_tensor3.dtype}  bftest_buffer:{self.bf16_test_tensor.dtype}"
-    #     )
-    #     self.bf16_test_tensor = self.bf16_test_tensor.float()
-    #     c = self.bf16_test_tensor.float() + a.float()
-    #     c2 = self.bf16_test_tensor2.float() + a.float()
-    #     c3 = self.bf16_test_tensor3.float() + a.float()
-    #     self.bf16_test_tensor2 *= 2
-    #     print(
-    #         f"bf16 test after convert: bf16_test_tensor:{self.bf16_test_tensor.dtype}  "
-    #         f"a:{a.dtype}  bftest2:{self.bf16_test_tensor2.dtype}  "
-    #         f"c:{c.dtype}  c2:{c2.dtype}  c3:{c3.dtype}"
-    #     )
-    #     ret = {
-    #         "a": a,
-    #         "c": c,
-    #         "c2": c2,
-    #         "c3": c3,
-    #         "bf16_test_tensor": self.bf16_test_tensor,
-    #         "bf16_test_tensor2": self.bf16_test_tensor2,
-    #     }
-    #     return ret
-
-    # def train(self, mode):
-    #     super().train(mode)
-    #
-    # def eval(self):
-    #     super().eval()
-    #
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -806,35 +766,49 @@ class LlamaForRM(LlamaPreTrainedModel):
 
         return values
 
+"""
+Use those models for specific experiments, 
+so you need to modify datasets and dataloader
+to satissfy the input format and the loss calculation 
+of the model
+"""
+
 class LlamaForPerplexity(LlamaForCausalLM):
     def __init__(self, config):
         super().__init__(config)
 
-        self.llama = LlamaModel(config)
-        self.init_method, self.output_layer_init_method = get_init_methods(config)
-        self.embed_out = ParallelLinear(
-            self.config,
-            init_method=self.init_method,
-            parallel_output=False,
-        )
-
-        # Initialize weights and apply final processing
-        self.post_init()
-
         self.llama.kv_enabled(False)
         self.llama.fmha_enabled(True)
 
+        # self.lm_loss = nn.CrossEntropyLoss(reduction="none")
+
+    def generate(self, prompts, tokenizer, max_length=1024, sample=False):
+        self.llama.fmha_enabled(False)
+        self.llama.kv_enabled(True)
+        generator = Generator(
+            super(
+                LlamaForPerplexity, self
+            ),  # we use LlamaForCausalLM as model for convenience
+            tokenizer,
+            prompts,
+            max_length=max_length,
+        )
+        outs = generator.run()
+        self.llama.fmha_enabled(True)
+        self.llama.kv_enabled(False)
+        return outs
+
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.LongTensor] = None,
+        input_ids,
+        attention_mask,
         position_ids: Optional[torch.LongTensor] = None,
-        compute_perplexity_loss_c1r4: Optional[bool] = False,
-        lm_mode: Optional[bool] = False,
-        **kwargs,
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        loss_mask = None,
+        ppl_coef = 0.1,
+    ) -> torch.Tensor:  # return loss
 
-        loss_mask = attention_mask.float().clone()
+        if loss_mask is None:
+            loss_mask = attention_mask.float()
 
         if position_ids is None:
             # Position ids.
@@ -844,6 +818,7 @@ class LlamaForPerplexity(LlamaForCausalLM):
             )
             position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
 
+        total_batch_size = input_ids.size(0)
         outputs = self.llama(
             input_ids,
             attention_mask=attention_mask,
@@ -858,26 +833,33 @@ class LlamaForPerplexity(LlamaForCausalLM):
         hidden_states = outputs[0]
         lm_logits = self.embed_out(hidden_states)[0]
 
-        labels = input_ids[:, 1:].contiguous()
+        total_labels = input_ids[:, 1:].contiguous()
         loss_mask = loss_mask[:, 1:].contiguous()
         shift_logits = lm_logits[:, :-1, :].float().contiguous()
-        logprobs = torch.nn.functional.log_softmax(shift_logits, dim=-1)
-        values = torch.gather(logprobs, -1, labels.unsqueeze(-1)).squeeze(-1)
+
         # sum on seq_len dim
+        logprobs = torch.nn.functional.log_softmax(shift_logits, dim=-1)
+        values = torch.gather(logprobs, -1, total_labels.unsqueeze(-1)).squeeze(-1)
         values = values * loss_mask
         values = values.sum(axis=-1)
 
-        if compute_perplexity_loss_c1r4:
-            total_batch_size = input_ids.size(0)
-            num_sample = total_batch_size // 5
-            chosen = values[:num_sample]
-            reject1 = values[num_sample : 2 * num_sample]
-            reject2 = values[2 * num_sample : 3 * num_sample]
-            reject3 = values[3 * num_sample : 4 * num_sample]
-            reject4 = values[4 * num_sample :]
-            loss_logits = 4 * chosen - reject1 - reject2 - reject3 - reject4
-            loss = -nn.functional.logsigmoid(loss_logits).mean()
-            return loss
+        num_sample = total_batch_size // 2
+        chosen = values[:num_sample]
+        reject = values[num_sample : 2 * num_sample]
+        loss_logits = chosen - reject
+        ppl_loss = -nn.functional.logsigmoid(loss_logits).mean()
 
-        # reutrn perplexity for convenience
-        return values
+        """
+        LM loss (calc only on chosen part of batch)
+        """
+        chosen_logits = shift_logits[:num_sample]
+        chosen_labels = total_labels[:num_sample]
+        lm_loss_mask = loss_mask[:num_sample]
+        lm_loss = nn.functional.cross_entropy(
+            chosen_logits.view(-1, chosen_logits.size(-1)),
+            chosen_labels.view(-1),
+            reduction="none",
+        )
+        lm_loss = (lm_loss * lm_loss_mask.view(-1)).sum() / lm_loss_mask.sum()
+        loss = ppl_coef * ppl_loss + (1 - ppl_coef) * lm_loss
+        return loss

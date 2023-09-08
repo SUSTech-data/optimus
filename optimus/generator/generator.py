@@ -4,6 +4,7 @@ from collections import deque
 import gc
 
 import tree
+from transformers.generation import LogitsWarper
 
 
 def empty_cache():
@@ -51,8 +52,83 @@ class Sequence:  # note that this object only exists on stage 1 and elder
 # %%
 
 
+def greedy_decode(logits):  # -> [batch_size,]
+    # logits come from model output, i.e. out.logits
+    next_token_logits = logits[:, -1, :]
+    next_tokens = torch.argmax(next_token_logits, dim=-1)
+    return next_tokens
+
+
+class top_p_decode:
+    """
+    [`LogitsWarper`] that performs top-p, i.e. restricting to top tokens summing to prob_cut_off <= prob_cut_off.
+
+    Args:
+        top_p (`float`):
+            If set to < 1, only the smallest set of most probable tokens with probabilities that add up to `top_p` or
+            higher are kept for generation.
+        filter_value (`float`, *optional*, defaults to `-float("Inf")`):
+            All filtered values will be set to this float value.
+        min_tokens_to_keep (`int`, *optional*, defaults to 1):
+            Minimum number of tokens that cannot be filtered.
+    """
+
+    def __init__(
+        self,
+        top_p: float = 0.9,
+        filter_value: float = -float("Inf"),
+        min_tokens_to_keep: int = 1,
+    ):
+        top_p = float(top_p)
+        if top_p < 0 or top_p > 1.0:
+            raise ValueError(f"`top_p` has to be a float > 0 and < 1, but is {top_p}")
+        if not isinstance(min_tokens_to_keep, int) or (min_tokens_to_keep < 1):
+            raise ValueError(
+                f"`min_tokens_to_keep` has to be a positive integer, but is {min_tokens_to_keep}"
+            )
+
+        self.top_p = top_p
+        self.filter_value = filter_value
+        self.min_tokens_to_keep = min_tokens_to_keep
+
+    def __call__(self, logits: torch.FloatTensor, top_p=None) -> torch.FloatTensor:
+        scores = logits[:, -1, :]
+        sorted_logits, sorted_indices = torch.sort(scores, descending=False)
+        cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+
+        # Remove tokens with cumulative top_p above the threshold (token with 0 are kept)
+        top_p = top_p if top_p is not None else self.top_p
+        sorted_indices_to_remove = cumulative_probs <= (1 - top_p)
+        # Keep at least min_tokens_to_keep
+        sorted_indices_to_remove[..., -self.min_tokens_to_keep :] = 0
+
+        # scatter sorted tensors to original indexing
+        indices_to_remove = sorted_indices_to_remove.scatter(
+            1, sorted_indices, sorted_indices_to_remove
+        )
+        scores = scores.masked_fill(indices_to_remove, self.filter_value)
+
+        probs = torch.nn.functional.softmax(scores, dim=-1)
+        next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+        return next_tokens
+
+
+# %%
+
+
 class Generator:
-    def __init__(self, model, tokenizer, prompts, stages=None, max_length=2048):
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        prompts,
+        stages=None,
+        max_length=2048,
+        decode_fn=greedy_decode,
+        forward_kwargs={"left_padding": True, "use_cache": True}, # assume you are using a optimus hf model
+    ):
+        self.decode = decode_fn
+        self.forward_kwargs = forward_kwargs
         # self.model = model.eval()
         model.eval()
         self.model = model
@@ -71,8 +147,6 @@ class Generator:
         and `trim` the batch information, give new sequence into batch,
         then model will inference
         """
-        # _default_stages = [(3, 4), (7, 8), (11, 12)]
-        # _default_stages = tree.map_structure(lambda x: 128 * x, _default_stages)
         _default_stages = [(400, 450, 128), (550, 600, 128), (700, 750, 64)]
         self.stages = stages if stages is not None else _default_stages
         self.stage_ptr = 0
@@ -133,8 +207,9 @@ class Generator:
             input_ids, attention_mask, position_ids, use_own_kv=False
         )
         kv = out.past_key_values
-        next_token_logits = out.logits[:, -1, :]
-        next_tokens = torch.argmax(next_token_logits, dim=-1)
+        # next_token_logits = out.logits[:, -1, :]
+        # next_tokens = torch.argmax(next_token_logits, dim=-1)
+        next_tokens = self.decode(out.logits)
         input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
         attention_mask = torch.cat(
             [
@@ -241,16 +316,18 @@ class Generator:
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     past_key_values=self.kv,
-                    use_cache=True,
-                    left_padding=True,
+                    # use_cache=True,
+                    # left_padding=True,
+                    **self.forward_kwargs,
                 )
             else:
                 out = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
-                    use_cache=True,
-                    left_padding=True,
+                    # use_cache=True,
+                    # left_padding=True,
+                    **self.forward_kwargs,
                 )
         except Exception as e:
             logging.error(f"Error: {e}")
@@ -262,8 +339,9 @@ class Generator:
         return out
 
     def _greedy_decode(self, out):
-        next_token_logits = out.logits[:, -1, :]
-        next_tokens = torch.argmax(next_token_logits, dim=-1)
+        # next_token_logits = out.logits[:, -1, :]
+        # next_tokens = torch.argmax(next_token_logits, dim=-1)
+        next_tokens = self.decode(out.logits)
         self.input_ids = torch.cat([self.input_ids, next_tokens[:, None]], dim=-1)
         self.attention_mask = torch.cat(
             [
@@ -472,8 +550,9 @@ class Generator:
                     input_ids, attention_mask, position_ids, use_own_kv=False
                 )
                 kv = out.past_key_values
-                next_token_logits = out.logits[:, -1, :]
-                next_tokens = torch.argmax(next_token_logits, dim=-1)
+                # next_token_logits = out.logits[:, -1, :]
+                # next_tokens = torch.argmax(next_token_logits, dim=-1)
+                next_tokens = self.decode(out.logits)
                 input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
                 attention_mask = torch.cat(
                     [
