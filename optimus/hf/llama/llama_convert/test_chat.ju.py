@@ -20,11 +20,10 @@ from deepspeed.runtime.pipe.topology import PipeModelDataParallelTopology
 from megatron import mpu, fused_kernels
 from deepspeed.ops.adam import FusedAdam
 from torch.utils.data.distributed import DistributedSampler
-from megatron.modeling_llama_neox import LlamaForCausalLM, LlamaForRM, LlamaConfig
+from optimus.hf.llama import LlamaForCausalLM, LlamaForRM, LlamaConfig
 from transformers import LlamaTokenizer, DataCollatorWithPadding
 from functools import wraps
 from itertools import combinations
-from ml_collections.config_dict import ConfigDict
 import os
 from typing import Iterable
 from pathlib import Path

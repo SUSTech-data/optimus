@@ -153,7 +153,9 @@ class AliBi(torch.nn.Module):
         slopes = torch.Tensor(self._get_slopes(num_heads))[
             mp_rank * self.slice_size : (mp_rank + 1) * self.slice_size
         ]
-        self.register_buffer("slopes", slopes)
+        # self.register_buffer("slopes", slopes)
+        # no need to register buffer, just use it at runtime
+        self.slopes = slopes
 
     def _get_slopes(self, n):
         """

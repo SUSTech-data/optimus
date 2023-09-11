@@ -416,6 +416,9 @@ class ParallelSelfAttention(nn.Module):
                             flash_attn_varlen_qkvpacked_func,
                             flash_attn_varlen_kvpacked_func,
                         )
+                        from flash_attn.flash_attn_triton import (
+                            flash_attn_qkvpacked_func as flash_triton_qkv_func,
+                        )
 
                         self.flash_qkv_fn = flash_attn_qkvpacked_func
                         self.flash_attn_fn = flash_attn_func
@@ -423,11 +426,13 @@ class ParallelSelfAttention(nn.Module):
 
                         self.flash_var_qkv_fn = flash_attn_varlen_qkvpacked_func
                         self.flash_var_kv_fn = flash_attn_varlen_kvpacked_func
+
+                        self.flash_triton_qkv_fn = flash_triton_qkv_func
                         # self.use_flash_attn2 = True
 
                 except ImportError:
-                    logging.warning("flash_attn not found, using default attn")
-                    logging.warning("Please upgrade flash_attn to >= 2.1.0")
+                    logging.error("flash_attn not found, using default attn")
+                    logging.error("Please upgrade flash_attn to >= 2.1.0")
                     self.use_flash_attention = False
                     # raise ImportError("Please install flash_attn >= 2.1.0")
 
@@ -567,9 +572,42 @@ class ParallelSelfAttention(nn.Module):
     ):
         # assert self.use_flash_attn2, "flash attn <2 not implemented in optimus"
         if self.pos_emb != "rotary":
-            raise NotImplementedError(
-                "Flash attention 2 requires rotary pos emb for now"
-            )
+            # raise NotImplementedError(
+            #     "Flash attention 2 requires rotary pos emb for now"
+            # )
+            """ALIBI pos embedding"""
+            sq, b, np, hn = query_layer.shape
+            sk = key_layer.size(0)
+            assert sq == sk, "sq != sk not supported yet"
+            assert key_layer.size(2) == np, "ALIBI GQA & MQA supported yet"
+
+            triton_shape = (b, sq, 1, np, hn)
+            query_layer = query_layer.transpose(0, 1).view(triton_shape)
+            key_layer = key_layer.transpose(0, 1).view(triton_shape)
+            value_layer = value_layer.transpose(0, 1).view(triton_shape)
+
+            qkv = torch.cat([query_layer, key_layer, value_layer], dim=2)
+
+            bias = self.alibi_embed.bias(sq, sk, query_layer.device, query_layer.dtype)
+            bias = bias.unsqueeze(0).tile((b, 1, 1, 1))
+            # bias = bias[:, :, :1, :]  # [1, np, 1, sk]
+            # bias = bias.unsqueeze(2)
+
+            # bias: [1, np, sq, sk]
+            logging.info("bias shape: {}".format(bias.shape))
+            logging.info("trition shape: {}".format(triton_shape))
+            # bias = bias.unsqueeze(0).tile((b, 1, 1, 1))
+            # logging.info("bias shape: {}".format(bias.shape))
+
+            output = self.flash_triton_qkv_fn(
+                qkv,
+                bias,
+                True,
+                None,
+            )  # [b, sq, np, hn]
+
+            output = output.transpose(0, 1).reshape(sq, b, np, hn)
+            return output
 
         if non_causal_attention_mask is None:
             """

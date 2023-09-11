@@ -1,9 +1,17 @@
 # %%
 
+# %cd ../optimus/optimus/hf/baichuan/baichuan_convert
+
+# %%
+
+import time
+
+start = time.time()
+
 import torch
 import json
-from transformers import LlamaForCausalLM, LlamaConfig
-from megatron.modeling_llama_neox import LlamaConfig as NeoxConfig
+from modeling_baichuan import BaichuanForCausalLM, BaichuanConfig
+from optimus.hf.baichuan import BaichuanConfig as NeoxConfig
 from transformers.modeling_utils import shard_checkpoint
 from transformers import AutoTokenizer
 from pathlib import Path
@@ -11,38 +19,44 @@ from collections import OrderedDict
 
 # %%
 
-import sys
-from absl import app, flags
-from absl.app import _run_init, parse_flags_with_usage
+from ipytorch.utils import is_notebook
+if not is_notebook():
+    import sys
+    from absl import app, flags
+    from absl.app import _run_init, parse_flags_with_usage
 
-FLAGS = flags.FLAGS
+    FLAGS = flags.FLAGS
 
-flags.DEFINE_string(
-    "model_path", None, "hf ckpt path", short_name="m"
-)
+    flags.DEFINE_string(
+        "model_path", None, "hf ckpt path", short_name="m"
+    )
 
-flags.DEFINE_string(
-    "output_path", None, "mp dst dir", short_name="o"
-)
-flags.DEFINE_integer(
-    "model_parallel_size", 8, "model parallel size", short_name="p"
-)
+    flags.DEFINE_string(
+        "output_path", None, "mp dst dir", short_name="o"
+    )
+    flags.DEFINE_integer(
+        "model_parallel_size", 4, "model parallel size", short_name="p"
+    )
 
-args = _run_init(sys.argv, parse_flags_with_usage)
+    args = _run_init(sys.argv, parse_flags_with_usage)
+
+    HF_DIR = Path(FLAGS.model_path)
+    SAVE_DIR = Path(FLAGS.output_path)
+    SAVE_DIR.mkdir(exist_ok=True)
+    MP_SIZE = int(FLAGS.model_parallel_size) # 8
+
+else:
+    HF_DIR = Path("/data/hf/baichuan13b-hf")
+    SAVE_DIR = Path("/data/hf/baichuan13b-mp4")
+    SAVE_DIR.mkdir(exist_ok=True)
+    MP_SIZE = 4
 
 # %%
 
-HF_DIR = Path(FLAGS.model_path)
-SAVE_DIR = Path(FLAGS.output_path)
-SAVE_DIR.mkdir(exist_ok=True)
-MP_SIZE = int(FLAGS.model_parallel_size) # 8
-
-# %%
-
-hf_config = LlamaConfig.from_pretrained(HF_DIR)
-tokenizer = AutoTokenizer.from_pretrained(HF_DIR)
-hf_model = LlamaForCausalLM.from_pretrained(
-    HF_DIR, device_map="cpu", torch_dtype=torch.float16
+hf_config = BaichuanConfig.from_pretrained(HF_DIR)
+tokenizer = AutoTokenizer.from_pretrained(HF_DIR, trust_remote_code=True, use_fast=False)
+hf_model = BaichuanForCausalLM.from_pretrained(
+    HF_DIR, device_map="cpu", torch_dtype=torch.float16, config=hf_config
 )
 
 # %%
@@ -56,7 +70,7 @@ def getattr_if(config, options, value=True):
     return None
 
 
-def convert_config(hf_config: LlamaConfig, isGQA: bool = False):
+def convert_config(hf_config: BaichuanConfig, isGQA: bool = False):
     neox_config = NeoxConfig(
         vocab_size=hf_config.vocab_size,
         hidden_size=hf_config.hidden_size,
@@ -64,9 +78,9 @@ def convert_config(hf_config: LlamaConfig, isGQA: bool = False):
         num_attention_heads=hf_config.num_attention_heads,
         intermediate_size=hf_config.intermediate_size,
         hidden_act=hf_config.hidden_act,
-        rotary_pct=1,
-        rotary_emb_base=10000,
-        max_position_embeddings=hf_config.max_position_embeddings,
+        # rotary_pct=1,
+        # rotary_emb_base=10000,
+        # max_position_embeddings=hf_config.max_position_embeddings,
         initializer_range=hf_config.initializer_range,
         rms_norm_epsilon=hf_config.rms_norm_eps,
         torch_dtype=hf_config.torch_dtype,
@@ -78,13 +92,10 @@ def convert_config(hf_config: LlamaConfig, isGQA: bool = False):
         use_parallel_residual=False,
     )
     neox_config.llama_mlp_multiple_of = 256
-    assert (
-        neox_config.intermediate_size % neox_config.llama_mlp_multiple_of == 0
-    ), f"{neox_config.intermediate_size} % {neox_config.llama_mlp_multiple_of}"
     neox_config.init_method = "small_init"
     neox_config.hidden_dropout = 0
     neox_config.output_layer_init_method = "wang_init"
-    neox_config.pos_emb = "rotary"
+    neox_config.pos_emb = "alibi"
     neox_config.norm = "rmsnorm"
     neox_config.gpt_j_residual = False
     neox_config.gpt_j_tied = False
@@ -114,26 +125,37 @@ mp_state_dict_list = [OrderedDict() for _ in range(MP_SIZE)]
 
 # %%
 
-def _select(keys, dct, map_fn=None, values=False):
+def _select(keys, dct, map_fn=None, values=False, inverse_match=False):
     if map_fn is None:
         map_fn = lambda x: x
     if not values:
-        return {k: map_fn(v) for k, v in dct.items() if k in keys}
+        if not inverse_match:
+            return {k: map_fn(v) for k, v in dct.items() if k in keys}
+        else:
+            return {k: map_fn(v) for k, v in dct.items() if k not in keys}
     else:
-        lst = [map_fn(v) for k, v in dct.items() if k in keys]
+        if not inverse_match:
+            lst = [map_fn(v) for k, v in dct.items() if k in keys]
+        else:
+            lst = [map_fn(v) for k, v in dct.items() if k not in keys]
         if len(lst) == 1:
             return lst[0]
         else:
             return lst
 
 
-def select_keyword(keyword, dct, map_fn=None, values=False):
+def select_keyword(keyword, dct, map_fn=None, values=False, inverse_match=False):
     keys = [k for k in dct.keys() if keyword in k]
-    return _select(keys, dct, map_fn, values)
+    return _select(keys, dct, map_fn, values, inverse_match)
 
 
 # %%
 
+neox_config = convert_config(hf_config, isGQA=False)
+hf_state_dict = hf_model.state_dict()
+neox_config
+
+# %%
 
 def NoeXTransformerLayerPrefix(i, llama_prefix="llama.layers"):
     qkv = f"{llama_prefix}.{i}.attention.query_key_value.weight"
@@ -166,21 +188,21 @@ def split_transformer_layer(
     """
 
     # QKV & O
-    num_q_heads_per_partition = neox_config.num_attention_heads // num_partitions
-    num_kv_heads_per_partition = neox_config.num_kv_heads // num_partitions
     head_dim = neox_config.hidden_size // neox_config.num_attention_heads
-    q_dim_per_partition = head_dim * num_q_heads_per_partition
-    kv_dim_per_partition = head_dim * num_kv_heads_per_partition
     o_dim_per_partition = neox_config.hidden_size // num_partitions
+    head_per_partition = neox_config.num_attention_heads // num_partitions
 
-    q = select_keyword("q_proj", layer_params, values=True)
-    k = select_keyword("k_proj", layer_params, values=True)
-    v = select_keyword("v_proj", layer_params, values=True)
+    qkv = select_keyword("W_pack", layer_params, values=True)
+    q,k,v = torch.split(qkv, neox_config.hidden_size, dim=0)
     o = select_keyword("o_proj", layer_params, values=True)
 
-    q_split = torch.split(q, q_dim_per_partition, dim=0)
-    k_split = torch.split(k, kv_dim_per_partition, dim=0)
-    v_split = torch.split(v, kv_dim_per_partition, dim=0)
+    q = q.view(neox_config.num_attention_heads, head_dim, neox_config.hidden_size)
+    k = k.view(neox_config.num_attention_heads, head_dim, neox_config.hidden_size)
+    v = v.view(neox_config.num_attention_heads, head_dim, neox_config.hidden_size)
+    q_split = torch.split(q, head_per_partition, dim=0)
+    k_split = torch.split(k, head_per_partition, dim=0) # (np, hn, hidden_size)
+    v_split = torch.split(v, head_per_partition, dim=0)
+
     o_split = torch.split(o, o_dim_per_partition, dim=1)  # along k dim
 
     # Layer Norm
@@ -201,7 +223,7 @@ def split_transformer_layer(
     w2_split = torch.split(w2, w_dim_per_partition, dim=1)  # along k dim
 
     # inv_freq
-    inv_freq = select_keyword("inv_freq", layer_params, values=True)
+    # inv_freq = select_keyword("inv_freq", layer_params, values=True)
 
     (
         qkv_name,
@@ -216,14 +238,15 @@ def split_transformer_layer(
 
     for rank in range(num_partitions):
         rank_dict = mp_state_dict_list[rank]
-        qkv = torch.concat([q_split[rank], k_split[rank], v_split[rank]], dim=0)
+        qkv = torch.concat([q_split[rank], k_split[rank], v_split[rank]], dim=1)
+        qkv = qkv.view(head_per_partition * 3 * head_dim, neox_config.hidden_size)
         rank_dict[qkv_name] = qkv.clone()
         rank_dict[dense_name] = o_split[rank].clone()
         rank_dict[w1_name] = w1_split[rank].clone()
         rank_dict[w2_name] = w2_split[rank].clone()
         rank_dict[w3_name] = w3_split[rank].clone()
 
-        rank_dict[inv_frq_name] = inv_freq
+        # rank_dict[inv_frq_name] = inv_freq
         rank_dict[i_layer_norm_name] = input_layer_norm
         rank_dict[p_layer_norm_name] = post_attention_layernorm
 
@@ -256,7 +279,7 @@ def split_causal_layer(hf_state_dict, mp_stata_dict_list, num_partitions=MP_SIZE
 
 # %%
 
-neox_config = convert_config(hf_config, isGQA=True)
+neox_config = convert_config(hf_config, isGQA=False)
 hf_state_dict = hf_model.state_dict()
 neox_config
 
@@ -278,6 +301,7 @@ split_causal_layer(hf_state_dict, mp_state_dict_list)
 
 
 save_dir = SAVE_DIR
+save_dir.mkdir(exist_ok=True)
 for rank in tqdm(range(MP_SIZE)):
     rank_dir = save_dir / f"part_{rank}"
     rank_dir.mkdir(exist_ok=True)
@@ -290,3 +314,6 @@ for rank in tqdm(range(MP_SIZE)):
         torch.save(shard, rank_dir / str(shard_file))
     neox_config.save_pretrained(rank_dir)
     tokenizer.save_pretrained(rank_dir)
+
+end = time.time()
+print(f"Total time: {end-start:.2f} seconds")
