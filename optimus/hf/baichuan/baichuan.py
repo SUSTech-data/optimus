@@ -23,6 +23,12 @@ from optimus.model.word_embeddings import Embedding
 from optimus.model.fused_softmax import FusedScaleMaskSoftmax
 from optimus.generator.generator import Generator
 
+"""
+Baichuan is exactly LlamaModel with ALIBI
+so we just change config, and for reusing of convert script
+we set model prefix as `llama` and `llama.layers`
+"""
+
 class BaichuanConfig(PretrainedConfig):
     model_type = "baichuan"
     keys_to_ignore_at_inference = ["past_key_values"]
@@ -512,3 +518,156 @@ class BaichuanForCausalLM(BaichuanPreTrainedModel):
         ] = self.embed_out.final_linear.weight.data[:old_vocab_size, :]
         self.embed_out = new_embed_out
         return
+
+
+class BaichuanForRM(BaichuanPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+
+        self.llama = BaichuanModel(config)
+        self.value_head = nn.Linear(self.config.hidden_size, 1, bias=False)
+
+        self.llama.kv_enabled(False)
+        self.llama.fmha_enabled(True)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+        self.bce_loss = nn.BCEWithLogitsLoss()
+
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        compute_loss_c1r1: Optional[bool] = False,
+        compute_loss_c1r2: Optional[bool] = False,
+        compute_loss_c1r4: Optional[bool] = False,
+        compute_loss_for_sentence_classification: Optional[bool] = False,
+        compute_softmax_c1r4: Optional[bool] = False,
+        labels: Optional[torch.LongTensor] = None,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        r"""
+        past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+            Tuple of `tuple(torch.FloatTensor)` of length `config.n_layers`, with each tuple having 2 tensors of shape
+            `(batch_size, num_heads, sequence_length, embed_size_per_head)`) and 2 additional tensors of shape
+            `(batch_size, num_heads, encoder_sequence_length, embed_size_per_head)`. The two additional tensors are
+            only required when the model is used as a decoder in a Sequence to Sequence model.
+
+            Contains pre-computed hidden-states (key and values in the self-attention blocks that can be used (see
+            `past_key_values` input) to speed up sequential decoding.
+
+            If `past_key_values` are used, the user can optionally input only the last `decoder_input_ids` (those that
+            don't have their past key value states given to this model) of shape `(batch_size, 1)` instead of all
+            `decoder_input_ids` of shape `(batch_size, sequence_length)`.
+        labels (`torch.LongTensor` of shape `(batch_size, )`):
+            Labels gives the length of each group of rewards.
+        use_cache (`bool`, *optional*):
+            If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding (see
+            `past_key_values`).
+
+        Returns:
+
+        """
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
+
+        # if model is used as a decoder in encoder-decoder model, the decoder attention mask is created on the fly
+        if attention_mask is None:
+            attention_mask = input_ids.new_ones(input_ids.shape)
+
+        if position_ids is None:
+            # Position ids.
+            batch_size, seq_length = input_ids.size()
+            # position_ids = torch.arange(
+            #     seq_length, dtype=torch.long, device=input_ids.device
+            # )
+            # position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
+
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            position_ids = position_ids.view(-1, seq_length).long()
+
+        outputs = self.llama(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        last_hidden_states = outputs.last_hidden_state
+        last_index = attention_mask.cumsum(dim=1).argmax(dim=1)
+        last_hidden_states = last_hidden_states.gather(
+            1, last_index.view(-1, 1, 1).expand(-1, 1, last_hidden_states.size(-1))
+        ).squeeze(1)
+        values = self.value_head(last_hidden_states).squeeze(-1)  # (bs,)
+
+        if compute_loss_for_sentence_classification:
+            loss = self.bce_loss(values.float(), labels.float())
+            return loss
+
+        if compute_loss_c1r1:
+            # first half is chosen, the other is rejected, by order
+            total_batch_size = input_ids.size(0)
+            assert total_batch_size % 2 == 0 and total_batch_size == len(values)
+            values = values.float()
+            chosen = values[: total_batch_size // 2]
+            rejected = values[total_batch_size // 2 :]
+            loss = -torch.nn.functional.logsigmoid(chosen - rejected).mean()
+            return loss
+
+        if compute_loss_c1r2:
+            total_batch_size = input_ids.size(0)
+            assert total_batch_size % 3 == 0 and total_batch_size == len(values)
+            values = values.float()
+            chosen = values[: total_batch_size // 3]
+            reject1 = values[total_batch_size // 3 : 2 * total_batch_size // 3]
+            reject2 = values[2 * total_batch_size // 3 :]
+            # loss = -torch.nn.functional.logsigmoid(2 * chosen - reject1 - reject2).mean()
+            loss = (
+                -torch.nn.functional.logsigmoid(chosen - reject1)
+                - torch.nn.functional.logsigmoid(chosen - reject2)
+            ).mean()
+            return loss
+
+        if compute_softmax_c1r4:
+            total_batch_size = input_ids.size(0)
+            assert total_batch_size % 5 == 0 and total_batch_size == len(values)
+            values = values.float()
+            num_sample = total_batch_size // 5
+
+            values = values.view(5, num_sample)
+            values = values.transpose(0, 1).contiguous()
+            label = torch.zeros(num_sample, dtype=torch.int64, device=values.device)
+            loss = torch.nn.functional.cross_entropy(values, label)
+            return loss
+
+        if compute_loss_c1r4:
+            total_batch_size = input_ids.size(0)
+            assert total_batch_size % 5 == 0 and total_batch_size == len(values)
+            values = values.float()
+            num_sample = total_batch_size // 5
+            chosen = values[:num_sample]
+            reject1 = values[num_sample : 2 * num_sample]
+            reject2 = values[2 * num_sample : 3 * num_sample]
+            reject3 = values[3 * num_sample : 4 * num_sample]
+            reject4 = values[4 * num_sample :]
+            loss = (
+                -torch.nn.functional.logsigmoid(chosen - reject1)
+                - torch.nn.functional.logsigmoid(chosen - reject2)
+                - torch.nn.functional.logsigmoid(chosen - reject3)
+                - torch.nn.functional.logsigmoid(chosen - reject4)
+            ).mean()
+            return loss
+
+        return values

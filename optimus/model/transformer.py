@@ -47,8 +47,16 @@ from optimus.model.fused_bias_dropout import (
     bias_dropout_add_fused_inference,
 )
 from optimus.model.utils import configure_sparse_attention
+XFORMER_READY = False
+try:
+    import xformers.ops as xops
+    XFORMER_READY = True
+except ImportError:
+    logging.warning("Xformers not found, when use ALIBI, back to fuse softmax")
+    pass
 
-# flags required to enable jit fusion kernels
+
+# flags require to enable jit fusion kernels
 torch._C._jit_set_profiling_mode(False)
 torch._C._jit_set_profiling_executor(False)
 torch._C._jit_override_can_fuse_on_cpu(True)
@@ -427,12 +435,23 @@ class ParallelSelfAttention(nn.Module):
                         self.flash_var_qkv_fn = flash_attn_varlen_qkvpacked_func
                         self.flash_var_kv_fn = flash_attn_varlen_kvpacked_func
 
-                        self.flash_triton_qkv_fn = flash_triton_qkv_func
+                        if self.pos_emb == "alibi":
+                            if not XFORMER_READY:
+                                raise ImportError
+                            # xops.memory_efficient_attention
+                            # self.attention_bias = xops.fmha.attn_bias.LowerTriangularMask()
+
+
+                        # self.flash_triton_qkv_fn = flash_triton_qkv_func
                         # self.use_flash_attn2 = True
 
                 except ImportError:
-                    logging.error("flash_attn not found, using default attn")
-                    logging.error("Please upgrade flash_attn to >= 2.1.0")
+                    message = """
+                    flash_attn not found or 
+                    `xformer` not found with alibi,
+                    using default attn
+                    """
+                    logging.error(message)
                     self.use_flash_attention = False
                     # raise ImportError("Please install flash_attn >= 2.1.0")
 
@@ -570,39 +589,41 @@ class ParallelSelfAttention(nn.Module):
     def flash_attention(
         self, query_layer, key_layer, value_layer, non_causal_attention_mask
     ):
+
         # assert self.use_flash_attn2, "flash attn <2 not implemented in optimus"
         if self.pos_emb != "rotary":
+
+            """ALIBI pos embedding"""
+
+            def next_multiple_of_8(n):
+                return n + (8 - n % 8) % 8
             # raise NotImplementedError(
             #     "Flash attention 2 requires rotary pos emb for now"
             # )
-            """ALIBI pos embedding"""
             sq, b, np, hn = query_layer.shape
             sk = key_layer.size(0)
-            assert sq == sk, "sq != sk not supported yet"
+            assert sq == sk, "sq != sk not supported yet, disable fmha by `model.llama.fmha_enbled(False)`"
             assert key_layer.size(2) == np, "ALIBI GQA & MQA supported yet"
 
-            triton_shape = (b, sq, 1, np, hn)
-            query_layer = query_layer.transpose(0, 1).view(triton_shape)
-            key_layer = key_layer.transpose(0, 1).view(triton_shape)
-            value_layer = value_layer.transpose(0, 1).view(triton_shape)
+            _bias = self.alibi_embed.bias(sq, sk, query_layer.device, query_layer.dtype)
+            _bias = _bias.unsqueeze(0).tile((b, 1, 1, 1))
+            bias = torch.empty(b, np, sq, next_multiple_of_8(sk), dtype=_bias.dtype, device=_bias.device)
+            bias[:, :,:,:sk] = _bias.contiguous()
+            bias = bias[:, :,:,:sk]
+            xops_q_shape = (b, sq, np, hn)
+            xops_kv_shape = (b, sk, np, hn)
 
-            qkv = torch.cat([query_layer, key_layer, value_layer], dim=2)
+            causal_mask = xops.fmha.attn_bias.LowerTriangularMaskWithTensorBias(bias)
+            query_layer = query_layer.transpose(0, 1).reshape(xops_q_shape)
+            key_layer = key_layer.transpose(0, 1).reshape(xops_kv_shape)
+            value_layer = value_layer.transpose(0, 1).reshape(xops_kv_shape)
 
-            bias = self.alibi_embed.bias(sq, sk, query_layer.device, query_layer.dtype)
-            bias = bias.unsqueeze(0).tile((b, 1, 1, 1))
-            # bias = bias[:, :, :1, :]  # [1, np, 1, sk]
-            # bias = bias.unsqueeze(2)
-
-            # bias: [1, np, sq, sk]
-            logging.info("bias shape: {}".format(bias.shape))
-            logging.info("trition shape: {}".format(triton_shape))
-            # bias = bias.unsqueeze(0).tile((b, 1, 1, 1))
-            # logging.info("bias shape: {}".format(bias.shape))
-
-            output = self.flash_triton_qkv_fn(
-                qkv,
-                bias,
-                True,
+            output = xops.memory_efficient_attention(
+                query_layer,
+                key_layer,
+                value_layer,
+                causal_mask,
+                self.dropout_p if self.training else 0.0,
                 None,
             )  # [b, sq, np, hn]
 

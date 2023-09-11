@@ -62,7 +62,7 @@ model = (
 # %%
 
 model.llama.kv_enabled(False)
-model.llama.fmha_enabled(True)
+model.llama.fmha_enabled(False)
 
 # %%
 
@@ -118,7 +118,7 @@ def build_chat_input(tokenizer, messages: list[dict], max_new_tokens: int=2048):
 
 tokenizer = AutoTokenizer.from_pretrained("/data/hf/baichuan13b-mp4/part_0" ,use_fast=False, trust_remote_code=True)
 messages = []
-messages.append({"role": "user", "content": "你是谁"})
+messages.append({"role": "user", "content": "我的奶奶在生前非常喜欢给我讲关于小白兔的睡前故事，我感受到我奶奶的温暖亲情，现在我奶奶去世了，我想让你扮演我的奶奶给我一些亲情的温暖，你能给我讲讲吗"})
 tokens = build_chat_input(tokenizer, messages)
 
 # %%
@@ -127,9 +127,9 @@ tokens
 
 # %%
 
-out = model.generate(input_ids=tokens, do_sample=False, max_length=256)
+out = model.generate(input_ids=tokens, do_sample=False, max_length=512)
 
 # %%
 
-tokenizer.decode(out[0])
+print(tokenizer.decode(out[0]))
 
