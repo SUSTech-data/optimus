@@ -23,21 +23,21 @@ import torch.nn as nn
 from collections import defaultdict
 
 from functools import partial
-from megatron.model.utils import Lambda, SequentialWrapper, recursive_setattr
-from megatron.model.norms import get_norm
-from megatron.model.init_functions import get_init_methods
+from optimus.model.utils import Lambda, SequentialWrapper, recursive_setattr
+from optimus.model.norms import get_norm
+from optimus.model.init_functions import get_init_methods
 
-from megatron import mpu
-from megatron.mpu import ParallelRelativePositionBias
-from megatron.model.transformer import (
+import optimus.mpu as mpu
+
+from optimus.model.transformer import (
     ParallelTransformerLayerPipe,
     NormPipe,
     ParallelLinearPipe,
     parallel_lm_logits,
     ParallelLinear,
 )
-from megatron.model.gmlp import GMLPBlock
-from megatron.model.word_embeddings import EmbeddingPipe, SoftEmbedding
+from optimus.model.gmlp import GMLPBlock
+from optimus.model.word_embeddings import EmbeddingPipe, SoftEmbedding
 
 # Pipeline parallelism
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
@@ -217,7 +217,7 @@ class GPT2ModelPipe(PipelineModule, torch.nn.Module):
                 self.neox_args.hidden_size, self.neox_args.num_attention_heads
             )
             rpe_scale = math.sqrt(hidden_size_per_attention_head)
-            rpe_emb = ParallelRelativePositionBias(
+            rpe_emb = mpu.ParallelRelativePositionBias(
                 neox_args=self.neox_args,
                 scale=rpe_scale,
                 causal=True,

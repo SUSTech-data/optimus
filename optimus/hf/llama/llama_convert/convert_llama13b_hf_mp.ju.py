@@ -6,7 +6,8 @@ start = time.time()
 import torch
 import json
 from transformers import LlamaForCausalLM, LlamaConfig
-from megatron.modeling_llama_neox import LlamaConfig as NeoxConfig
+# from megatron.modeling_llama_neox import LlamaConfig as NeoxConfig
+from optimus.hf.llama import LlamaConfig as NeoxConfig
 from transformers.modeling_utils import shard_checkpoint
 from transformers import AutoTokenizer
 from pathlib import Path

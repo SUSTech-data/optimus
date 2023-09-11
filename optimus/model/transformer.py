@@ -47,12 +47,23 @@ from optimus.model.fused_bias_dropout import (
     bias_dropout_add_fused_inference,
 )
 from optimus.model.utils import configure_sparse_attention
+
+def map_int(x):
+    try:
+        return int(x)
+    except ValueError:
+        return 0
+        
 XFORMER_READY = False
 try:
+    import xformers
+    x_version = tuple(map(map_int, xformers.__version__.split(".")))
+    if x_version < (0,0,21):
+        raise ImportError
     import xformers.ops as xops
     XFORMER_READY = True
 except ImportError:
-    logging.warning("Xformers not found, when use ALIBI, back to fuse softmax")
+    logging.error("Xformers >= 0.0.21 not found, when use ALIBI, back to fuse softmax")
     pass
 
 
@@ -395,11 +406,6 @@ class ParallelSelfAttention(nn.Module):
             )
         else:
 
-            def map_int(x):
-                try:
-                    return int(x)
-                except ValueError:
-                    return 0
 
             if self.use_flash_attention:
                 """
