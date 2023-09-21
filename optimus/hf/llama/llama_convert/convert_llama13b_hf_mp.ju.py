@@ -235,7 +235,8 @@ def split_transformer_layer(
         rank_dict[w2_name] = w2_split[rank].clone()
         rank_dict[w3_name] = w3_split[rank].clone()
 
-        rank_dict[inv_frq_name] = inv_freq
+        if isinstance(inv_freq, torch.Tensor):
+            rank_dict[inv_frq_name] = inv_freq
         rank_dict[i_layer_norm_name] = input_layer_norm
         rank_dict[p_layer_norm_name] = post_attention_layernorm
 

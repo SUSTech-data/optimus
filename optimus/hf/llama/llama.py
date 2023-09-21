@@ -753,7 +753,7 @@ class LlamaForRM(LlamaPreTrainedModel):
             reject3 = values[3 * num_sample : 4 * num_sample]
             reject4 = values[4 * num_sample :]
             loss = (
-                -torch.nn.functional.logsigmoid(chosen - reject1)
+                - torch.nn.functional.logsigmoid(chosen - reject1)
                 - torch.nn.functional.logsigmoid(chosen - reject2)
                 - torch.nn.functional.logsigmoid(chosen - reject3)
                 - torch.nn.functional.logsigmoid(chosen - reject4)
@@ -762,12 +762,14 @@ class LlamaForRM(LlamaPreTrainedModel):
 
         return values
 
+
 """
 Use those models for specific experiments, 
 so you need to modify datasets and dataloader
 to satissfy the input format and the loss calculation 
 of the model
 """
+
 
 class LlamaForPerplexity(LlamaForCausalLM):
     def __init__(self, config):
@@ -778,20 +780,45 @@ class LlamaForPerplexity(LlamaForCausalLM):
 
         # self.lm_loss = nn.CrossEntropyLoss(reduction="none")
 
-    def generate(self, prompts, tokenizer, max_length=1024, sample=False):
+    def generate(self, prompts, tokenizer, max_length=1024, sample=False, mpu=None):
+        if mpu is not None:
+            dp_rank = mpu.get_data_parallel_rank()
+            dp_size = mpu.get_data_parallel_world_size()
+            length_per_rank = len(prompts) // dp_size
+            start = dp_rank * length_per_rank
+            end = (dp_rank + 1) * length_per_rank
+            end = end if end < len(prompts) else len(prompts)
+            rank_prompts = prompts[start:end]
+            prompts = rank_prompts
+
+        tokenizer.padding_side = "left"
         self.llama.fmha_enabled(False)
         self.llama.kv_enabled(True)
+        _forward = self.forward
+        self.forward = lambda *args, **kwargs: LlamaForCausalLM.forward(
+            self, *args, **kwargs
+        )
+        # stages = [(400, 450, 64), (550, 600, 64), (700, 750, 32)]
         generator = Generator(
-            super(
-                LlamaForPerplexity, self
-            ),  # we use LlamaForCausalLM as model for convenience
+            self,
             tokenizer,
             prompts,
             max_length=max_length,
+            stages=None,
         )
         outs = generator.run()
+        self.forward = _forward
         self.llama.fmha_enabled(True)
         self.llama.kv_enabled(False)
+
+        if mpu is not None:
+            dp_group = mpu.get_data_parallel_group()
+            _outs = mpu.utils.gather_object(outs, dp_group)
+            outs = []
+            for out in _outs:
+                outs.extend(out)
+
+        tokenizer.padding_side = "right"
         return outs
 
     def forward(
@@ -799,10 +826,9 @@ class LlamaForPerplexity(LlamaForCausalLM):
         input_ids,
         attention_mask,
         position_ids: Optional[torch.LongTensor] = None,
-        loss_mask = None,
-        ppl_coef = 0.1,
+        loss_mask=None,
+        ppl_coef=0.3,
     ) -> torch.Tensor:  # return loss
-
         if loss_mask is None:
             loss_mask = attention_mask.float()
 
@@ -830,14 +856,14 @@ class LlamaForPerplexity(LlamaForCausalLM):
         lm_logits = self.embed_out(hidden_states)[0]
 
         total_labels = input_ids[:, 1:].contiguous()
-        loss_mask = loss_mask[:, 1:].contiguous()
+        loss_mask = loss_mask[:, :-1].contiguous()
         shift_logits = lm_logits[:, :-1, :].float().contiguous()
 
         # sum on seq_len dim
         logprobs = torch.nn.functional.log_softmax(shift_logits, dim=-1)
         values = torch.gather(logprobs, -1, total_labels.unsqueeze(-1)).squeeze(-1)
         values = values * loss_mask
-        values = values.sum(axis=-1)
+        values = values.sum(dim=-1)
 
         num_sample = total_batch_size // 2
         chosen = values[:num_sample]

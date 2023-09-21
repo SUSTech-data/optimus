@@ -61,7 +61,7 @@ model = (
 
 # %%
 
-model.llama.kv_enabled(False)
+model.llama.kv_enabled(True)
 model.llama.fmha_enabled(False)
 
 # %%

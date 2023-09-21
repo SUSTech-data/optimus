@@ -17,6 +17,13 @@
 
 
 import torch
+import torch.distributed as dist
+
+def gather_object(obj, group=None):
+    world_size = dist.get_world_size(group)
+    return_list = [None] * world_size
+    dist.all_gather_object(return_list, obj, group=group)
+    return return_list
 
 
 def ensure_divisibility(numerator, denominator):

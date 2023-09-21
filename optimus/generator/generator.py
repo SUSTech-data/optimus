@@ -125,7 +125,10 @@ class Generator:
         stages=None,
         max_length=2048,
         decode_fn=greedy_decode,
-        forward_kwargs={"left_padding": True, "use_cache": True}, # assume you are using a optimus hf model
+        forward_kwargs={
+            "left_padding": True,
+            "use_cache": True,
+        },  # assume you are using a optimus hf model
     ):
         self.decode = decode_fn
         self.forward_kwargs = forward_kwargs
@@ -462,8 +465,14 @@ class Generator:
 
             if len(long_sentence_batch_idxs) == self.run_batch_size:
                 logging.info(f"Batch cutted with shape {self.run_shape}")
-                self.outputs.append(self.input_ids)
-                self.output_idxs.append(self.batch_global_idxs)
+
+                for i in long_sentence_batch_idxs:
+                    sequence = Sequence(
+                        self.input_ids[i],
+                        self.attention_mask[i],
+                        self.batch_global_idxs[i],
+                    )
+                    self.stage_buffer.append(sequence)
 
                 self.batch_global_idxs = []
 
@@ -651,7 +660,8 @@ class Generator:
             last_stage_capicity = len(self.stage_buffer)
             last_stage_seq_len = self.stages[i][1]  # threshould
             num_picking_from_buffer = 0
-            mini_batch_size = 32
+            # mini_batch_size = 32
+            mini_batch_size = int(self.stages[i][2] / 2)
             while True:
                 # 1. fill self state
                 run_batch_size, run_seq_len = self.run_shape

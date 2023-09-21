@@ -17,10 +17,12 @@ import torch.distributed as dist
 from accelerate.utils import set_seed
 from deepspeed.ops.adam import FusedAdam
 from deepspeed.runtime.pipe.topology import PipeModelDataParallelTopology
-from megatron import mpu, fused_kernels
+# from megatron import mpu, fused_kernels
 from deepspeed.ops.adam import FusedAdam
 from torch.utils.data.distributed import DistributedSampler
 from optimus.hf.llama import LlamaForCausalLM, LlamaForRM, LlamaConfig
+import optimus.mpu as mpu
+from optimus import load_fused_kernels
 from transformers import LlamaTokenizer, DataCollatorWithPadding
 from functools import wraps
 from itertools import combinations
@@ -38,7 +40,6 @@ from tqdm.auto import tqdm
 
 tqdm.pandas()
 from functools import partial
-import joblib
 import sys
 from ipytorch.utils import is_notebook
 
@@ -96,7 +97,7 @@ def init_locally():
     set_seed(seed)
     deepspeed.checkpointing.configure(mpu, partition_activations=True)
     mpu.model_parallel_cuda_manual_seed(seed)
-    fused_kernels.load_fused_kernels()
+    load_fused_kernels()
 
 init_locally()
 

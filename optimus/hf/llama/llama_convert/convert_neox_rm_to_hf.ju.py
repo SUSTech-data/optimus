@@ -11,7 +11,7 @@ from ipytorch import logging
 from tqdm.auto import tqdm
 from collections import OrderedDict
 from transformers import LlamaConfig, LlamaTokenizer
-from megatron.modeling_llama_neox import LlamaConfig as LlamaConfigNeox
+from optimus.hf.llama import LlamaConfig as LlamaConfigNeox
 from functools import partial
 from pathlib import Path
 import sys
