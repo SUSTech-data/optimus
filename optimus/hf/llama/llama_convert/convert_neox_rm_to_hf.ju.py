@@ -169,9 +169,14 @@ for i in tqdm(range(hf_config.num_hidden_layers)):
 
 if MODEL_TYPE == "reward":
     # FOR VALUE HEAD, suppose value head do not split, init by each mp rank
-    concat_weight[f"value_head.weight"] = states[0]["value_head.weight"]
+    # concat_weight[f"value_head.weight"] = states[0]["value_head.weight"]
+    concat_weight["value_head.weight"] = torch.cat(
+        [t["value_head.weight"] for t in states], dim=0
+    )
     if "value_head.bias" in states[0]:
-        concat_weight[f"value_head.bias"] = states[0]["value_head.bias"]
+        concat_weight["value_head.bias"] = torch.cat(
+            [t["value_head.bias"] for t in states], dim=0
+        )
 
 elif MODEL_TYPE == "causal":
     concat_weight[f"lm_head.weight"] = torch.cat(

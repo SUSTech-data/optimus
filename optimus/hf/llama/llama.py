@@ -37,6 +37,9 @@ from optimus.model.transformer import ParallelLinear, ParallelTransformerLayer
 from optimus.model.word_embeddings import Embedding
 from optimus.model.fused_softmax import FusedScaleMaskSoftmax
 from optimus.generator.generator import Generator
+import optimus.mpu as mpu
+from functools import partial
+import optimus.model.init_functions as init
 
 
 """ llama model configuration"""
@@ -279,11 +282,10 @@ class LlamaModel(LlamaPreTrainedModel):
             # layer.attention.use_flash_attention = (not use_cache) and use_fmha
 
         self.use_cache = use_cache
-        self.gradient_checkpointing = not use_cache
+        # self.gradient_checkpointing = not use_cache
 
     def checkpointing_enabled(self, c: bool):
-        self.kv_enabled(not c)
-        # self.gradient_checkpointing = c  # done in kv_enabled
+        self.gradient_checkpointing = c  # done in kv_enabled
 
     def forward(
         self,
@@ -614,8 +616,16 @@ class LlamaForRM(LlamaPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
 
+        self.config = config
         self.llama = LlamaModel(config)
-        self.value_head = nn.Linear(self.config.hidden_size, 1, bias=False)
+        logging.info(f"LlamaModel loaded, {config.params_dtype}")
+        self.value_head = mpu.ColumnParallelLinear(
+            config,
+            config.hidden_size,
+            mpu.get_model_parallel_world_size(),
+            bias=False,
+            gather_output=True,
+        )
 
         self.llama.kv_enabled(False)
         self.llama.fmha_enabled(True)
@@ -624,6 +634,13 @@ class LlamaForRM(LlamaPreTrainedModel):
         self.post_init()
 
         self.bce_loss = nn.BCEWithLogitsLoss()
+        self.need_value_dropout = False
+        if hasattr(config, "value_dropout") and config.value_dropout > 0:
+            from optimus.hf.model_utils import StableDropout
+
+            p = config.value_dropout
+            self.value_dropout = StableDropout(p)
+            self.need_value_dropout = True
 
     def forward(
         self,
@@ -640,6 +657,7 @@ class LlamaForRM(LlamaPreTrainedModel):
         compute_loss_c1r4: Optional[bool] = False,
         compute_loss_for_sentence_classification: Optional[bool] = False,
         compute_softmax_c1r4: Optional[bool] = False,
+        compute_loss_c1r4_new: Optional[bool] = False,
         labels: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
@@ -695,12 +713,15 @@ class LlamaForRM(LlamaPreTrainedModel):
             return_dict=return_dict,
         )
 
-        last_hidden_states = outputs.last_hidden_state
+        last_hidden_states = outputs[0]
         last_index = attention_mask.cumsum(dim=1).argmax(dim=1)
         last_hidden_states = last_hidden_states.gather(
             1, last_index.view(-1, 1, 1).expand(-1, 1, last_hidden_states.size(-1))
         ).squeeze(1)
-        values = self.value_head(last_hidden_states).squeeze(-1)  # (bs,)
+        if self.need_value_dropout:
+            last_hidden_states = self.value_dropout(last_hidden_states)
+        values = self.value_head(last_hidden_states)[0]  # (bs, world_size)
+        values = values.mean(dim=1) # (bs,)
 
         if compute_loss_for_sentence_classification:
             loss = self.bce_loss(values.float(), labels.float())
@@ -758,6 +779,17 @@ class LlamaForRM(LlamaPreTrainedModel):
                 - torch.nn.functional.logsigmoid(chosen - reject3)
                 - torch.nn.functional.logsigmoid(chosen - reject4)
             ).mean()
+            return loss
+
+        if compute_loss_c1r4_new:
+            total_batch_size = input_ids.size(0)
+            assert total_batch_size % 5 == 0 and total_batch_size == len(values)
+            values = values.float()
+            num_sample = total_batch_size // 5
+
+            values = values.view(num_sample, 5).contiguous()
+            label = torch.zeros(num_sample, dtype=torch.int64, device=values.device)
+            loss = torch.nn.functional.cross_entropy(values, label)
             return loss
 
         return values

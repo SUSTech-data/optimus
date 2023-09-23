@@ -12,6 +12,7 @@ import torch
 import json
 from modeling_baichuan import BaichuanForCausalLM, BaichuanConfig
 from optimus.hf.baichuan import BaichuanConfig as NeoxConfig
+from optimus.hf.baichuan import BaichuanRopeConfig as NeoxRopeConfig
 from transformers.modeling_utils import shard_checkpoint
 from transformers import AutoTokenizer
 from pathlib import Path
@@ -37,7 +38,9 @@ if not is_notebook():
     flags.DEFINE_integer(
         "model_parallel_size", 4, "model parallel size", short_name="p"
     )
-
+    flags.DEFINE_bool(
+        "alibi", True, "is alibi", short_name="alibi"
+    )
     args = _run_init(sys.argv, parse_flags_with_usage)
 
     HF_DIR = Path(FLAGS.model_path)
@@ -71,52 +74,105 @@ def getattr_if(config, options, value=True):
 
 
 def convert_config(hf_config: BaichuanConfig, isGQA: bool = False):
-    neox_config = NeoxConfig(
-        vocab_size=hf_config.vocab_size,
-        hidden_size=hf_config.hidden_size,
-        num_hidden_layers=hf_config.num_hidden_layers,
-        num_attention_heads=hf_config.num_attention_heads,
-        intermediate_size=hf_config.intermediate_size,
-        hidden_act=hf_config.hidden_act,
-        # rotary_pct=1,
-        # rotary_emb_base=10000,
-        # max_position_embeddings=hf_config.max_position_embeddings,
-        initializer_range=hf_config.initializer_range,
-        rms_norm_epsilon=hf_config.rms_norm_eps,
-        torch_dtype=hf_config.torch_dtype,
-        use_cache=True,
-        pad_token_id=0,
-        bos_token_id=1,
-        eos_token_id=2,
-        tie_word_embeddings=False,
-        use_parallel_residual=False,
-    )
-    neox_config.llama_mlp_multiple_of = 256
-    neox_config.init_method = "small_init"
-    neox_config.hidden_dropout = 0
-    neox_config.output_layer_init_method = "wang_init"
-    neox_config.pos_emb = "alibi"
-    neox_config.norm = "rmsnorm"
-    neox_config.gpt_j_residual = False
-    neox_config.gpt_j_tied = False
-    neox_config.apply_query_key_layer_scaling = False
-    neox_config.attention_softmax_in_fp32 = False
-    neox_config.scaled_masked_softmax_fusion = True
-    neox_config.scaled_upper_triang_masked_softmax_fusion = False
-    neox_config.bias_gelu_fusion = False
-    neox_config.attention_dropout = 0
-    neox_config.output_layer_parallelism = "column"
-    neox_config.eod_mask_loss = False
-    neox_config.bias_dropout_fusion = False
-    neox_config.attention_config = [[["flash"], "all"]]
-    neox_config.mlp_type = "llama"
-    neox_config.use_bias_in_attn_linear = False
-    neox_config.lora = False
+    if FLAGS.alibi:
+        neox_config = NeoxConfig(
+            vocab_size=hf_config.vocab_size,
+            hidden_size=hf_config.hidden_size,
+            num_hidden_layers=hf_config.num_hidden_layers,
+            num_attention_heads=hf_config.num_attention_heads,
+            intermediate_size=hf_config.intermediate_size,
+            hidden_act=hf_config.hidden_act,
+            # rotary_pct=1,
+            # rotary_emb_base=10000,
+            # max_position_embeddings=hf_config.max_position_embeddings,
+            initializer_range=hf_config.initializer_range,
+            rms_norm_epsilon=hf_config.rms_norm_eps,
+            torch_dtype=hf_config.torch_dtype,
+            use_cache=True,
+            pad_token_id=0,
+            bos_token_id=1,
+            eos_token_id=2,
+            tie_word_embeddings=False,
+            use_parallel_residual=False,
+            tokenizer_class=hf_config.tokenizer_class,
+        )
+        neox_config.llama_mlp_multiple_of = 256
+        neox_config.init_method = "small_init"
+        neox_config.hidden_dropout = 0
+        neox_config.output_layer_init_method = "wang_init"
+        neox_config.pos_emb = "alibi"
+        neox_config.norm = "rmsnorm"
+        neox_config.gpt_j_residual = False
+        neox_config.gpt_j_tied = False
+        neox_config.apply_query_key_layer_scaling = False
+        neox_config.attention_softmax_in_fp32 = False
+        neox_config.scaled_masked_softmax_fusion = True
+        neox_config.scaled_upper_triang_masked_softmax_fusion = False
+        neox_config.bias_gelu_fusion = False
+        neox_config.attention_dropout = 0
+        neox_config.output_layer_parallelism = "column"
+        neox_config.eod_mask_loss = False
+        neox_config.bias_dropout_fusion = False
+        neox_config.attention_config = [[["flash"], "all"]]
+        neox_config.mlp_type = "llama"
+        neox_config.use_bias_in_attn_linear = False
+        neox_config.lora = False
 
-    neox_config.isGQA = isGQA
-    num_kv_heads = getattr_if(hf_config, ["num_kv_heads", "num_key_value_heads"])
-    if num_kv_heads:
-        neox_config.num_kv_heads = num_kv_heads
+        neox_config.isGQA = isGQA
+        num_kv_heads = getattr_if(hf_config, ["num_kv_heads", "num_key_value_heads"])
+        if num_kv_heads:
+            neox_config.num_kv_heads = num_kv_heads
+    else:
+        neox_config = NeoxRopeConfig(
+            vocab_size=hf_config.vocab_size,
+            hidden_size=hf_config.hidden_size,
+            num_hidden_layers=hf_config.num_hidden_layers,
+            num_attention_heads=hf_config.num_attention_heads,
+            intermediate_size=hf_config.intermediate_size,
+            hidden_act=hf_config.hidden_act,
+            rotary_pct=1,
+            rotary_emb_base=10000,
+            max_position_embeddings=hf_config.max_position_embeddings,
+            initializer_range=hf_config.initializer_range,
+            rms_norm_epsilon=hf_config.rms_norm_eps,
+            torch_dtype=hf_config.torch_dtype,
+            use_cache=True,
+            pad_token_id=0,
+            bos_token_id=1,
+            eos_token_id=2,
+            tie_word_embeddings=False,
+            use_parallel_residual=False,
+            tokenizer_class=hf_config.tokenizer_class,
+        )
+        neox_config.llama_mlp_multiple_of = 256
+        # assert (
+        #     neox_config.intermediate_size % neox_config.llama_mlp_multiple_of == 0
+        # ), f"{neox_config.intermediate_size} % {neox_config.llama_mlp_multiple_of}"
+        neox_config.init_method = "small_init"
+        neox_config.hidden_dropout = 0
+        neox_config.output_layer_init_method = "wang_init"
+        neox_config.pos_emb = "rotary"
+        neox_config.norm = "rmsnorm"
+        neox_config.gpt_j_residual = False
+        neox_config.gpt_j_tied = False
+        neox_config.apply_query_key_layer_scaling = False
+        neox_config.attention_softmax_in_fp32 = False
+        neox_config.scaled_masked_softmax_fusion = True
+        neox_config.scaled_upper_triang_masked_softmax_fusion = False
+        neox_config.bias_gelu_fusion = False
+        neox_config.attention_dropout = 0
+        neox_config.output_layer_parallelism = "column"
+        neox_config.eod_mask_loss = False
+        neox_config.bias_dropout_fusion = False
+        neox_config.attention_config = [[["flash"], "all"]]
+        neox_config.mlp_type = "llama"
+        neox_config.use_bias_in_attn_linear = False
+        neox_config.lora = False
+
+        neox_config.isGQA = isGQA
+        num_kv_heads = getattr_if(hf_config, ["num_kv_heads", "num_key_value_heads"])
+        if num_kv_heads:
+            neox_config.num_kv_heads = num_kv_heads
     return neox_config
 
 # %%

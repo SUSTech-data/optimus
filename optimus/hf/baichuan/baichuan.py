@@ -69,6 +69,101 @@ class BaichuanConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+        self.init_epilogue()
+
+    def init_epilogue(self):
+        self.num_layers = self.num_hidden_layers
+        self.use_mup = False
+        self.use_cpu_initialization = False
+        self.opt_pos_emb_offset = False
+        self.activation = getattr(self, "hidden_act", "silu")
+        self.padded_vocab_size = self.vocab_size
+        self.precision = "fp16" if self.torch_dtype == "float16" else "bfloat16"
+        self.use_flash_attention = True
+        self.use_cache = True
+
+        self.isGQA = getattr(self, "isGQA", False)
+
+    @property
+    def params_dtype(self):
+        return torch.float16 if self.precision == "fp16" else torch.bfloat16
+
+    def __getattr__(self, name):
+        if "mup" in name or "bnb" in name:
+            return None  # disable mup & bnb for now
+        else:
+            return object.__getattribute__(self, name)
+
+class BaichuanRopeConfig(PretrainedConfig):
+    model_type = "llama"
+
+    def __init__(
+        self,
+        vocab_size=32000,
+        hidden_size=4096,
+        num_hidden_layers=32,
+        num_attention_heads=32,
+        intermediate_size=11008,
+        hidden_act="silu",
+        rotary_pct=1,
+        rotary_emb_base=10000,
+        max_position_embeddings=2048,
+        initializer_range=0.02,
+        rms_norm_epsilon=1.0e-6,
+        use_cache=True,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        tie_word_embeddings=False,
+        use_parallel_residual=True,
+        **kwargs,
+    ):
+        self.vocab_size = vocab_size
+        self.max_position_embeddings = max_position_embeddings
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.intermediate_size = intermediate_size
+        self.hidden_act = hidden_act
+        self.rotary_pct = rotary_pct
+        self.rotary_emb_base = rotary_emb_base
+        self.initializer_range = initializer_range
+        self.rms_norm_epsilon = rms_norm_epsilon
+        self.use_cache = use_cache
+        self.tie_word_embeddings = tie_word_embeddings
+        self.use_parallel_residual = use_parallel_residual
+        self.pos_emb = "rotary"
+        super().__init__(
+            pad_token_id=pad_token_id,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            tie_word_embeddings=tie_word_embeddings,
+            **kwargs,
+        )
+        self.init_epilogue()
+
+    def init_epilogue(self):
+        self.num_layers = self.num_hidden_layers
+        self.use_mup = False
+        self.use_cpu_initialization = False
+        self.opt_pos_emb_offset = False
+        self.activation = getattr(self, "hidden_act", "silu")
+        self.padded_vocab_size = self.vocab_size
+        self.precision = "fp16" if self.torch_dtype == "float16" else "bfloat16"
+        self.use_flash_attention = True
+        self.use_cache = True
+
+        self.isGQA = getattr(self, "isGQA", False)
+
+    @property
+    def params_dtype(self):
+        return torch.float16 if self.precision == "fp16" else torch.bfloat16
+
+    def __getattr__(self, name):
+        if "mup" in name or "bnb" in name:
+            return None  # disable mup & bnb for now
+        else:
+            return object.__getattribute__(self, name)
 
 class BaichuanPreTrainedModel(PreTrainedModel):
     """
@@ -129,6 +224,7 @@ class BaichuanModel(BaichuanPreTrainedModel):
         config.attention_config = expand_attention_types(
             config.attention_config, config.num_hidden_layers
         )
+        is_rotary = config.pos_emb == "rotary"
         self.config = config
         self.init_method, self.output_layer_init_method = get_init_methods(config)
         self.embed_in = Embedding(
@@ -149,7 +245,7 @@ class BaichuanModel(BaichuanPreTrainedModel):
                     output_layer_init_method=self.output_layer_init_method,
                     layer_number=i,
                     rpe=None,
-                    rotary=False,
+                    rotary=is_rotary,
                     use_cache=config.use_cache,
                 )
                 for i in range(config.num_hidden_layers)
@@ -534,6 +630,13 @@ class BaichuanForRM(BaichuanPreTrainedModel):
         self.post_init()
 
         self.bce_loss = nn.BCEWithLogitsLoss()
+        self.config = config
+        self.need_value_dropout = False
+        if hasattr(config, "value_dropout") and config.value_dropout > 0:
+            from optimus.hf.model_utils import StableDropout
+            p = config.value_dropout
+            self.value_dropout = StableDropout(p)
+            self.need_value_dropout = True
 
     def forward(
         self,
@@ -550,6 +653,7 @@ class BaichuanForRM(BaichuanPreTrainedModel):
         compute_loss_c1r4: Optional[bool] = False,
         compute_loss_for_sentence_classification: Optional[bool] = False,
         compute_softmax_c1r4: Optional[bool] = False,
+        compute_loss_c1r4_new: Optional[bool] = False,
         labels: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
@@ -610,6 +714,8 @@ class BaichuanForRM(BaichuanPreTrainedModel):
         last_hidden_states = last_hidden_states.gather(
             1, last_index.view(-1, 1, 1).expand(-1, 1, last_hidden_states.size(-1))
         ).squeeze(1)
+        if self.need_value_dropout:
+            last_hidden_states = self.value_dropout(last_hidden_states)
         values = self.value_head(last_hidden_states).squeeze(-1)  # (bs,)
 
         if compute_loss_for_sentence_classification:
@@ -668,6 +774,19 @@ class BaichuanForRM(BaichuanPreTrainedModel):
                 - torch.nn.functional.logsigmoid(chosen - reject3)
                 - torch.nn.functional.logsigmoid(chosen - reject4)
             ).mean()
+            return loss
+
+        if compute_loss_c1r4_new:
+            total_batch_size = input_ids.size(0)
+            assert total_batch_size % 5 == 0 and total_batch_size == len(values)
+            values = values.float()
+            num_sample = total_batch_size // 5
+
+            values = values.view(num_sample, 5).contiguous()
+            # values = values.view(5, num_sample)
+            # values = values.transpose(0, 1).contiguous()
+            label = torch.zeros(num_sample, dtype=torch.int64, device=values.device)
+            loss = torch.nn.functional.cross_entropy(values, label)
             return loss
 
         return values
