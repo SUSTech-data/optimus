@@ -189,10 +189,11 @@ else:  # backbone
 
 # %%
 
-
+from optimus.hf.baichuan import BaichuanTokenizer
 neox_config = BaichuanConfigNeox.from_pretrained(CKPT_PATH / "part_0")
+tokenizer = BaichuanTokenizer.from_pretrained(CKPT_PATH / "part_0")
 # tokenizer = LlamaTokenizer.from_pretrained(CKPT_PATH / "part_0")
-tokenizer = AutoTokenizer.from_pretrained(HF_PATH, trust_remote_code=True, use_fast=False)
+# tokenizer = AutoTokenizer.from_pretrained(HF_PATH, trust_remote_code=True, use_fast=False)
 
 def convert_config(neox_config, rm=True):
     hf_config = BaichuanConfig(

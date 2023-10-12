@@ -11,7 +11,7 @@ class LlamaRewardModel(PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.model = LlamaModel(config)
-        self.value_head = nn.Linear(config.hidden_size, 1, bias=False)
+        self.value_head = nn.Linear(config.hidden_size, 2, bias=False)
         print("LlamaRewardModel init")
 
     def forward(
@@ -29,6 +29,7 @@ class LlamaRewardModel(PreTrainedModel):
             last_hidden_states = last_hidden_states.gather(
                 1, last_index.view(-1, 1, 1).expand(-1, 1, last_hidden_states.size(-1))
             ).squeeze(1)
-        values = self.value_head(last_hidden_states).squeeze(-1)  # (bs,)
+        values = self.value_head(last_hidden_states).squeeze(-1)  # (bs,2)
+        values = values.mean(dim=1) # (bs,)
 
         return values

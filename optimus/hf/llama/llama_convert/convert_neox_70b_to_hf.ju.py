@@ -28,20 +28,16 @@ import shutil
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string("model_path", None, "MP model path", short_name="m")
-
 flags.DEFINE_string("output_path", None, "HF model output path", short_name="o")
-
 flags.DEFINE_string("hf_path", None, "dir to hf ckpt to get config", short_name="h")
-flags.DEFINE_integer("mp_size", 4, "model parallel size", short_name="p")
+flags.DEFINE_integer("mp_size", 8, "model parallel size", short_name="p")
 
 flags.DEFINE_string(
     "model_type",
-    "causal",
+    "reward",
     "model type (`causal`, `backbone` or `reward`)",
     short_name="t",
 )
-flags.DEFINE_bool("is_baichuan", False, "baichuan")
-
 
 args = _run_init(sys.argv, parse_flags_with_usage)
 
@@ -60,7 +56,6 @@ logging.info(FLAGS)
 
 # %%
 
-
 Hf_LLAMA = "model"
 Neox_LLAMA = "llama"
 
@@ -69,7 +64,6 @@ Noex_EMBED_IN_KEY = "embed_in.word_embeddings.weight"
 
 Hf_FINAL_NORM_KEY = "norm.weight"
 Neox_FINAL_NORM_KEY = "final_layer_norm.scale"
-
 
 # %%
 
@@ -110,6 +104,7 @@ for i in tqdm(range(mp_partitions)):
 LLAMA backbone convert
 """
 
+import gc
 concat_weight[f"{Hf_LLAMA}.{Hf_EMBED_IN_KEY}"] = torch.cat(
     [t[f"{Neox_LLAMA}.{Noex_EMBED_IN_KEY}"] for t in states], dim=0
 )
@@ -121,24 +116,32 @@ for i in tqdm(range(hf_config.num_hidden_layers)):
     hf_layer_prefix = f"{Hf_LLAMA}.layers.{i}"
     neox_layer_prefix = f"{Neox_LLAMA}.layers.{i}"
 
-    sharded_qkv = torch.cat(
-        [
-            state[f"{neox_layer_prefix}.attention.query_key_value.weight"]
-            for state in states
-        ],
-        dim=0,
-    )
-    sharded_qkv = sharded_qkv.view(num_heads, 3, dims_per_head, hidden_size)
-    q, k, v = sharded_qkv.chunk(3, dim=1)
-    concat_weight[f"{hf_layer_prefix}.self_attn.q_proj.weight"] = q.reshape(
-        num_heads * dims_per_head, hidden_size
-    )
-    concat_weight[f"{hf_layer_prefix}.self_attn.k_proj.weight"] = k.reshape(
-        num_heads * dims_per_head, hidden_size
-    )
-    concat_weight[f"{hf_layer_prefix}.self_attn.v_proj.weight"] = v.reshape(
-        num_heads * dims_per_head, hidden_size
-    )
+    sharded_qkv = [
+        state[f"{neox_layer_prefix}.attention.query_key_value.weight"]
+        for state in states
+    ] # (1280, hidden_dim)
+
+    qs, ks, vs = [], [], []
+    for qkv in sharded_qkv:
+        q = qkv[:1024, :]
+        k = qkv[1024:1024+128, :]
+        v = qkv[1024+128:, :]
+        assert k.size(0) == v.size(0) == 128 and q.size(1) == k.size(1) == v.size(1) == 8192
+
+        qs.append(q)
+        ks.append(k)
+        vs.append(v)
+
+    q = torch.cat(qs, dim=0)
+    k = torch.cat(ks, dim=0)
+    v = torch.cat(vs, dim=0)
+
+    # sharded_qkv = sharded_qkv.view(num_heads, 3, dims_per_head, hidden_size)
+    # q, k, v = sharded_qkv.chunk(3, dim=1)
+
+    concat_weight[f"{hf_layer_prefix}.self_attn.q_proj.weight"] = q
+    concat_weight[f"{hf_layer_prefix}.self_attn.k_proj.weight"] = k
+    concat_weight[f"{hf_layer_prefix}.self_attn.v_proj.weight"] = v
 
     concat_weight[f"{hf_layer_prefix}.self_attn.o_proj.weight"] = torch.cat(
         [t[f"{neox_layer_prefix}.attention.dense.weight"] for t in states], dim=1
@@ -165,12 +168,12 @@ for i in tqdm(range(hf_config.num_hidden_layers)):
     concat_weight[f"{hf_layer_prefix}.mlp.down_proj.weight"] = torch.cat(
         [t[f"{neox_layer_prefix}.mlp.w2.weight"] for t in states], dim=1
     )
+    gc.collect()
 
 # %%
 
 if MODEL_TYPE == "reward":
     # FOR VALUE HEAD, suppose value head do not split, init by each mp rank
-    # concat_weight[f"value_head.weight"] = states[0]["value_head.weight"]
     concat_weight["value_head.weight"] = torch.cat(
         [t["value_head.weight"] for t in states], dim=0
     )
@@ -179,8 +182,11 @@ if MODEL_TYPE == "reward":
             [t["value_head.bias"] for t in states], dim=0
         )
 
+    # concat_weight["value_head.weight"] = states[0]["value_head.weight"]
+    # concat_weight["value_head.weight"] = states[0]["value_head.weight"]
+
 elif MODEL_TYPE == "causal":
-    concat_weight[f"lm_head.weight"] = torch.cat(
+    concat_weight["lm_head.weight"] = torch.cat(
         [t["embed_out.final_linear.weight"] for t in states], dim=0
     )
 
@@ -191,11 +197,7 @@ else:  # backbone
 
 
 neox_config = LlamaConfigNeox.from_pretrained(CKPT_PATH / "part_0")
-if not FLAGS.is_baichuan:
-    tokenizer = LlamaTokenizer.from_pretrained(CKPT_PATH / "part_0")
-else:
-    from optimus.hf.baichuan import BaichuanTokenizer
-    tokenizer = BaichuanTokenizer.from_pretrained(CKPT_PATH / "part_0")
+tokenizer = LlamaTokenizer.from_pretrained(CKPT_PATH / "part_0")
 
 def convert_config(neox_config, rm=True):
     hf_config = LlamaConfig(
@@ -216,6 +218,9 @@ def convert_config(neox_config, rm=True):
         torch_dtype=neox_config.torch_dtype,
         # rope_scaling={"type": "linear", "factor": neox_config.rotary_pct},
     )
+    if neox_config.isGQA:
+        print("THIS IS GQA MODEL")
+
     if rm:
         hf_config.auto_map = {
             "AutoModelForSequenceClassification": "modeling_llama_rm.LlamaRewardModel"
@@ -225,8 +230,11 @@ def convert_config(neox_config, rm=True):
     return hf_config
 
 
-hf_config = convert_config(neox_config, rm=MODEL_TYPE == "reward")
-shards, index = shard_checkpoint(concat_weight, "5GB")
+# hf_config = convert_config(neox_config, rm=MODEL_TYPE == "reward")
+hf_config.model_parallel_size = mp_partitions
+hf_config.vocab_size = neox_config.vocab_size
+hf_config.torch_dtype = neox_config.torch_dtype
+shards, index = shard_checkpoint(concat_weight, "10GB")
 with open(SAVE_DIR / "pytorch_model.bin.index.json", "w", encoding="utf-8") as f:
     content = json.dumps(index, indent=2, sort_keys=True) + "\n"
     f.write(content)
@@ -237,9 +245,10 @@ for shard_file, shard in tqdm(shards.items()):
 
 tokenizer.save_pretrained(SAVE_DIR)
 hf_config.save_pretrained(SAVE_DIR)
-shutil.copy(Path("modeling_llama_rm.py"), SAVE_DIR / "modeling_llama_rm.py")
+# shutil.copy(Path("modeling_llama_rm.py"), SAVE_DIR / "modeling_llama_rm.py")
 
 # %%
 
 used = time.time() - start
 print(f"Convert used {used:.2f}s")
+

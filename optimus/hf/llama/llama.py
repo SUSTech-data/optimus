@@ -768,11 +768,13 @@ class LlamaForRM(LlamaPreTrainedModel):
             assert total_batch_size % 5 == 0 and total_batch_size == len(values)
             values = values.float()
             num_sample = total_batch_size // 5
-            chosen = values[:num_sample]
-            reject1 = values[num_sample : 2 * num_sample]
-            reject2 = values[2 * num_sample : 3 * num_sample]
-            reject3 = values[3 * num_sample : 4 * num_sample]
-            reject4 = values[4 * num_sample :]
+
+            values = values.view(num_sample, 5).contiguous()
+            chosen = values[:, 0]
+            reject1 = values[:, 1]
+            reject2 = values[:, 2]
+            reject3 = values[:, 3]
+            reject4 = values[:, 4]
             loss = (
                 - torch.nn.functional.logsigmoid(chosen - reject1)
                 - torch.nn.functional.logsigmoid(chosen - reject2)
