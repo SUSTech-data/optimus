@@ -34,7 +34,7 @@ topo = PipeModelDataParallelTopology(
 )
 rank = dist.get_rank()
 world_size = dist.get_world_size()
-use_device = [4, 5, 6, 7]
+use_device = [0,1,4,5]
 rank_device = dict(zip(range(world_size), use_device))
 device = rank_device[rank]
 torch.cuda.set_device(device)
@@ -57,7 +57,7 @@ model = LlamaForCausalLM.from_pretrained(
 # %%
 
 question = "Introduce prime number"
-header = f"""### Instruction:\n\n{question}"""
+header = f"""### Instruction:\n{question}"""
 mid = "\n### Response:"
 prompt = f"{header}{mid}"
 print(prompt)
@@ -65,7 +65,7 @@ print(prompt)
 # %%
 
 question = "Hello, who are you?"
-header = f"""### Instruction:\n\n{question}"""
+header = f"""### Instruction:\n{question}"""
 mid = "\n### Response:"
 prompt1 = f"{header}{mid}"
 print(prompt1)

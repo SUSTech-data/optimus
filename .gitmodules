@@ -1,3 +1,0 @@
-[submodule "vllm"]
-	path = vllm
-	url = git@github.com:SUSTech-data/vllm.git

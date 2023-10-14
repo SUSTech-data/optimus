@@ -2,7 +2,7 @@
 
 # %load_ext autoreload
 # %autoreload 2
-# %cd ../reasoning
+# %cd ../optimus
 # %load_ext ipytorch
 # %cluster start --n=4 --engines=MPI
 

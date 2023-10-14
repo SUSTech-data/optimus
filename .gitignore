@@ -152,3 +152,4 @@ logs/
 tensorboard/
 src/
 sync.sh
+memory.py

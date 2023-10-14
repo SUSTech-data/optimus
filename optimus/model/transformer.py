@@ -48,19 +48,23 @@ from optimus.model.fused_bias_dropout import (
 )
 from optimus.model.utils import configure_sparse_attention
 
+
 def map_int(x):
     try:
         return int(x)
     except ValueError:
         return 0
-        
+
+
 XFORMER_READY = False
 try:
     import xformers
+
     x_version = tuple(map(map_int, xformers.__version__.split(".")))
-    if x_version < (0,0,21):
+    if x_version < (0, 0, 21):
         raise ImportError
     import xformers.ops as xops
+
     XFORMER_READY = True
 except ImportError:
     logging.error("Xformers >= 0.0.21 not found, when use ALIBI, back to fuse softmax")
@@ -252,23 +256,6 @@ class ParallelLinear(nn.Module):
                 mup_rescale_parameters=is_last_layer,  # rescale params only called if neox_args.use_mup = True, despite it not being included here
             )
 
-    #        else:
-    #            print(
-    #                'ERROR: Output layer parallelism over the hidden dim is currently broken (https://github.com/EleutherAI/gpt-neox/issues/905). Please run with output_layer_parallelism = "column" until this issue is fixed.'
-    #            )
-    #            exit()
-    #            self.final_linear = mpu.RowParallelLinear(
-    #                neox_args=neox_args,
-    #                input_size=neox_args.hidden_size,
-    #                output_size=neox_args.padded_vocab_size,
-    #                bias=False,
-    #                input_is_parallel=False,
-    #                init_method=init_method,
-    #                parallel_output=parallel_output,
-    #                skip_bias_add=False,
-    #                mup_rescale_parameters=is_last_layer,  # only called if neox_args.use_mup = True, despite it not being included here
-    #            )
-
     def forward(self, hidden_states):
         return self.final_linear(hidden_states)
 
@@ -313,6 +300,9 @@ class ParallelSelfAttention(nn.Module):
             neox_args.num_attention_heads, world_size
         )
         self.pos_emb = neox_args.pos_emb
+        self.num_head_per_partition = mpu.divide(
+            neox_args.num_attention_heads, world_size
+        )
 
         self.isGQA = bool(
             getattr(neox_args, "isGQA", False)
@@ -405,8 +395,6 @@ class ParallelSelfAttention(nn.Module):
                 mpu=mpu,
             )
         else:
-
-
             if self.use_flash_attention:
                 """
                 Optimus only support flash attention > 2.1
@@ -446,7 +434,6 @@ class ParallelSelfAttention(nn.Module):
                                 raise ImportError
                             # xops.memory_efficient_attention
                             # self.attention_bias = xops.fmha.attn_bias.LowerTriangularMask()
-
 
                         # self.flash_triton_qkv_fn = flash_triton_qkv_func
                         # self.use_flash_attn2 = True
@@ -595,27 +582,35 @@ class ParallelSelfAttention(nn.Module):
     def flash_attention(
         self, query_layer, key_layer, value_layer, non_causal_attention_mask
     ):
-
         # assert self.use_flash_attn2, "flash attn <2 not implemented in optimus"
         if self.pos_emb != "rotary":
-
             """ALIBI pos embedding"""
 
             def next_multiple_of_8(n):
                 return n + (8 - n % 8) % 8
+
             # raise NotImplementedError(
             #     "Flash attention 2 requires rotary pos emb for now"
             # )
             sq, b, np, hn = query_layer.shape
             sk = key_layer.size(0)
-            assert sq == sk, "sq != sk not supported yet, disable fmha by `model.llama.fmha_enbled(False)`"
+            assert (
+                sq == sk
+            ), "sq != sk not supported yet, disable fmha by `model.llama.fmha_enbled(False)`"
             assert key_layer.size(2) == np, "ALIBI GQA & MQA supported yet"
 
             _bias = self.alibi_embed.bias(sq, sk, query_layer.device, query_layer.dtype)
             _bias = _bias.unsqueeze(0).tile((b, 1, 1, 1))
-            bias = torch.empty(b, np, sq, next_multiple_of_8(sk), dtype=_bias.dtype, device=_bias.device)
-            bias[:, :,:,:sk] = _bias.contiguous()
-            bias = bias[:, :,:,:sk]
+            bias = torch.empty(
+                b,
+                np,
+                sq,
+                next_multiple_of_8(sk),
+                dtype=_bias.dtype,
+                device=_bias.device,
+            )
+            bias[:, :, :, :sk] = _bias.contiguous()
+            bias = bias[:, :, :, :sk]
             xops_q_shape = (b, sq, np, hn)
             xops_kv_shape = (b, sk, np, hn)
 

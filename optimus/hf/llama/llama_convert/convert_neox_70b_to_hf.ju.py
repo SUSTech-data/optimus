@@ -121,6 +121,8 @@ for i in tqdm(range(hf_config.num_hidden_layers)):
         for state in states
     ] # (1280, hidden_dim)
 
+    # ONLY FOR LLAMA 70B
+
     qs, ks, vs = [], [], []
     for qkv in sharded_qkv:
         q = qkv[:1024, :]
